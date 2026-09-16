@@ -933,12 +933,18 @@ class Net:
                 connection.via_lane = self._get_lane(connection.via_id)
             connection.from_edge = self.edges.get(connection.from_edge_id, None)
             if connection.from_edge is not None:
-                connection.from_lane = connection.from_edge.get_lane(connection.from_lane_index)
-                connection.from_lane.outgoing_connections.append(connection)
+                try:
+                    connection.from_lane = connection.from_edge.get_lane(connection.from_lane_index)
+                    connection.from_lane.outgoing_connections.append(connection)
+                except IndexError:
+                    pass
             connection.to_edge = self.edges.get(connection.to_edge_id, None)
             if connection.to_edge is not None:
-                connection.to_lane = connection.to_edge.get_lane(connection.to_lane_index)
-                connection.to_lane.incoming_connections.append(connection)
+                try:
+                    connection.to_lane = connection.to_edge.get_lane(connection.to_lane_index)
+                    connection.to_lane.incoming_connections.append(connection)
+                except IndexError:
+                    pass
         # make junction-related links
         for junction in self.junctions.values():
             if junction.type == "internal":
@@ -960,10 +966,15 @@ class Net:
                         reqs = []
                         try:
                             req = junction.get_request_by_int_lane(cxn.via_id)
-                        except IndexError:  # if no request found for via, look one level deeper
+                        except (IndexError, TypeError):  # if no request found for via, look one level deeper
                             cxns_internal = self._get_connections_from_lane(cxn.via_id)
                             for cxni in cxns_internal:
-                                req = junction.get_request_by_int_lane(cxni.via_id)
+                                if cxni.via_id is None:
+                                    continue
+                                try:
+                                    req = junction.get_request_by_int_lane(cxni.via_id)
+                                except (IndexError, TypeError):
+                                    continue
                                 reqs.append(req)
                         else:
                             reqs.append(req)
@@ -1015,7 +1026,12 @@ class Net:
         edge_id = "_".join(lane_id.split("_")[:-1])
         lane_num = int(lane_id.split("_")[-1])
         edge = self.edges.get(edge_id, None)
-        return edge.get_lane(lane_num) if edge is not None else None
+        if edge is None:
+            return None
+        try:
+            return edge.get_lane(lane_num)
+        except IndexError:
+            return None
 
     def _get_mask(self):
         """

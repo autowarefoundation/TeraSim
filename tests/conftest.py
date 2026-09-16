@@ -26,18 +26,6 @@ def project_root() -> Path:
     return PROJECT_ROOT
 
 
-@pytest.fixture(scope="session") 
-def test_data_dir() -> Path:
-    """Provide the test data directory path."""
-    return PROJECT_ROOT / "tests" / "fixtures" / "data"
-
-
-@pytest.fixture(scope="session")
-def test_config_dir() -> Path:
-    """Provide the test configuration directory path."""
-    return PROJECT_ROOT / "tests" / "fixtures" / "configs"
-
-
 @pytest.fixture
 def temp_dir():
     """Provide a temporary directory for test outputs."""
@@ -82,12 +70,6 @@ def example_scenario_config() -> Path:
 def test_maps_dir() -> Path:
     """Provide the test maps directory path."""
     return PROJECT_ROOT / "examples" / "maps"
-
-
-@pytest.fixture
-def mcity_map_path(test_maps_dir) -> Path:
-    """Provide path to Mcity test map."""
-    return test_maps_dir / "Mcity"
 
 
 @pytest.fixture(autouse=True)

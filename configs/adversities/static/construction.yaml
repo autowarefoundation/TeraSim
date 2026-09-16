@@ -1,6 +1,0 @@
-adversity_cfg:
-  static:
-    construction:
-      _target_: terasim_nde_nade.adversity.ConstructionAdversity
-      _convert_: 'all'
-      lane_id: "" 

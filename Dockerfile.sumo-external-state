@@ -1,0 +1,85 @@
+ARG TERASIM_BASE_IMAGE=terasim-service:inprocess
+
+FROM ${TERASIM_BASE_IMAGE} AS sumo-builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG SUMO_TAG=v1_23_1
+ARG SUMO_SOURCE_COMMIT=676720d13f6f42d8c79d156e9d67001f8c22f6f6
+ARG SUMO_BUILD_JOBS=2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    git \
+    libeigen3-dev \
+    libfox-1.6-dev \
+    libgdal-dev \
+    libgl2ps-dev \
+    libproj-dev \
+    libxerces-c-dev \
+    swig \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --branch "${SUMO_TAG}" --depth 1 \
+    https://github.com/eclipse-sumo/sumo.git /opt/sumo-source \
+    && test "$(git -C /opt/sumo-source rev-parse HEAD)" = "${SUMO_SOURCE_COMMIT}"
+
+COPY apps/sumo_external_state/sumo-v1.23.1-set-external-state.patch \
+    /tmp/sumo-v1.23.1-set-external-state.patch
+
+RUN git -C /opt/sumo-source apply --unidiff-zero --check \
+        /tmp/sumo-v1.23.1-set-external-state.patch \
+    && git -C /opt/sumo-source apply --unidiff-zero \
+        /tmp/sumo-v1.23.1-set-external-state.patch
+
+RUN cmake -S /opt/sumo-source -B /opt/sumo-source/build-external-state \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCHECK_OPTIONAL_LIBS=OFF \
+    -DENABLE_CS_BINDINGS=OFF \
+    -DENABLE_JAVA_BINDINGS=OFF \
+    -DENABLE_PYTHON_BINDINGS=ON \
+    -DFMI=OFF \
+    -DNETEDIT=OFF \
+    -DSUMO_UTILS=ON \
+    && cmake --build /opt/sumo-source/build-external-state \
+        --target sumo sumo-gui netconvert netgenerate libsumo \
+        -j"${SUMO_BUILD_JOBS}"
+
+RUN mkdir -p /opt/sumo-external-state/bin \
+    && cp /opt/sumo-source/bin/sumo /opt/sumo-external-state/bin/ \
+    && cp /opt/sumo-source/bin/sumo-gui /opt/sumo-external-state/bin/ \
+    && cp /opt/sumo-source/bin/netconvert /opt/sumo-external-state/bin/ \
+    && cp /opt/sumo-source/bin/netgenerate /opt/sumo-external-state/bin/ \
+    && cp -a /opt/sumo-source/data /opt/sumo-external-state/data \
+    && cp -a /opt/sumo-source/tools /opt/sumo-external-state/tools
+
+FROM ${TERASIM_BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL org.opencontainers.image.title="TeraSim SUMO moveToXYImmediate build" \
+      org.opencontainers.image.version="SUMO-v1.23.1-immediate-movetoxy-2" \
+      org.opencontainers.image.source="https://github.com/eclipse-sumo/sumo" \
+      org.opencontainers.image.revision="676720d13f6f42d8c79d156e9d67001f8c22f6f6"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libfox-1.6-0 \
+    libgdal36 \
+    libgl2ps1.4 \
+    libproj25 \
+    libxerces-c3.2t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sumo-builder /opt/sumo-external-state /opt/sumo-external-state
+COPY --from=sumo-builder /opt/sumo-source/tools/traci/ \
+    /usr/local/lib/python3.10/site-packages/traci/
+COPY --from=sumo-builder /opt/sumo-source/tools/libsumo/ \
+    /usr/local/lib/python3.10/site-packages/libsumo/
+COPY packages/terasim-service/terasim_service/ \
+    /app/packages/terasim-service/terasim_service/
+
+ENV SUMO_HOME=/opt/sumo-external-state
+ENV PATH="/opt/sumo-external-state/bin:${PATH}"
+
+RUN sumo --version \
+    && python3 -c "import traci; assert hasattr(traci.vehicle, 'moveToXYImmediate')" \
+    && python3 -c "import libsumo; assert hasattr(libsumo.vehicle, 'moveToXYImmediate')"

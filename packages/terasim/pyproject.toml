@@ -27,7 +27,6 @@ dependencies = [
     "bidict>=0.23.1",
     "attrs>=23.2.0",
     "addict>=2.4.0",
-    "redis>=5.0.2",
     "lxml>=5.1.0",
     "pydantic>=2.6.3",
     "pyproj>=3.6.1",
@@ -41,12 +40,6 @@ nde-nade = ["terasim-nde-nade>=0.2.0"]
 
 # Service API
 service = ["terasim-service>=0.2.0"]
-
-# Environment generation tools
-envgen = ["terasim-envgen>=0.2.0"]
-
-# Data processing tools
-datazoo = ["terasim-datazoo>=0.2.0"]
 
 # Visualization tools
 visualization = ["terasim-vis>=0.2.0"]
@@ -66,8 +59,7 @@ dev = [
 
 # Predefined combinations
 essentials = ["terasim[nde-nade,service]"]
-tools = ["terasim[envgen,datazoo,visualization]"]
-full = ["terasim[nde-nade,service,envgen,datazoo,visualization]"]
+full = ["terasim[nde-nade,service,visualization]"]
 
 [tool.setuptools.packages.find]
 include = ["terasim*"]

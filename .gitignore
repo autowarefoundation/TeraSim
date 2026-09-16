@@ -37,6 +37,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
+reports/
 htmlcov/
 .tox/
 .nox/
@@ -188,6 +189,15 @@ README_QUICKSTART.md
 run_experiments_debug.py
 test_docker.sh
 /local_test
+
+# Deploy outputs (legacy)
+apps/deploy/outputs
+apps/deploy/examples/maps
+
+# Local generated artifacts
+reference_code/
+
+# Visualization outputs (upstream)
 vis_config.yaml
 /output_images
 /output_lidar_bev

@@ -6,160 +6,76 @@
 </p>
 </div>
 
-
-
 <p align="center">
-<strong>Generative AI–Driven Autonomous Vehicle Simulation for Unknown Unsafe Events Discovery</strong>
+<strong>Naturalistic and adversarial traffic simulation for discovering unknown unsafe events</strong>
 </p>
 
 ---
 
 ## Overview
 
-TeraSim is an open-source platform for automated autonomous-vehicle (AV) simulation using generative AI.
-Its primary objective is to **efficiently uncover real-world unknown unsafe events** by automatically creating diverse and statistically realistic traffic environments.
+TeraSim is an open-source platform for automated autonomous-vehicle simulation.
+Its objective is to **efficiently uncover real-world unknown unsafe events** by
+automatically creating diverse and statistically realistic traffic environments:
 
-The framework has evolved from its initial focus on planning-and-control testing to a **complete simulation workflow**, which now includes:
+- **Naturalistic driving environment (NDE)** — background traffic derived from
+  large-scale naturalistic driving data, with statistical realism.
+- **Adversarial scenario synthesis (NADE)** — rare, high-risk interactions such
+  as aggressive cut-ins and unexpected crossings, injected into that traffic to
+  reach the failures that matter for safety validation.
+- Built on [SUMO](https://www.eclipse.org/sumo/), and able to drive third-party
+  simulators such as [CARLA](https://carla.org/) and
+  [Autoware](https://github.com/autowarefoundation/autoware).
 
-1. **High-fidelity HD map generation** for large-scale, accurate simulation environments
-2. **Generative traffic environment creation** for naturalistic and adversarial scenario testing
-3. **Generative sensor simulation** for camera and LiDAR perception validation
+## About this fork
 
-This expanded scope enables a unified pipeline from map generation to perception and planning validation.
+This is a reduced fork of [mcity/TeraSim](https://github.com/mcity/TeraSim),
+reworked for **three-way co-simulation: Autoware × CARLA × TeraSim**. Autoware
+drives the ego vehicle through
+[`autoware_carla_interface`](https://github.com/autowarefoundation/autoware_universe/tree/main/simulator/autoware_carla_interface),
+and TeraSim supplies the background traffic around it.
 
-## 🚀 **Updates**
+- **Single-process CARLA link** (`terasim-service`): the TeraSim loop and the
+  CARLA client run as two threads of one process, exchanging states and commands
+  as plain Python objects. TeraSim traffic is mirrored into a running CARLA
+  server; the externally driven ego is fed back into SUMO so the background
+  traffic reacts to it. TeraSim can follow the ego side's clock or own it.
+- **Optional physics-based background vehicles**: selected CARLA vehicles are
+  driven by Ackermann control, and their measured pose is written back into
+  SUMO.
 
-- **[09/29/2025]**: TeraSim-World source codes are available. See [TeraSim_World.md](docs/TeraSim_World.md) to get started.
+Detailed documentation of the co-simulation setup will follow.
 
+## Running
 
-
-## **🌎 New Feature: TeraSim-World**
-
-
-[<img src="docs/figure/TeraSim_World.png" height="400px">](https://www.youtube.com/watch?v=75T1-2Ce0Ds)
-
-<h3 align="center">
-📄 <a href="https://arxiv.org/abs/2509.13164">arXiv</a> | 🌐 <a href="https://wjiawei.com/terasim-world-web/">Website</a> | 🎥 <a href="https://www.youtube.com/watch?v=75T1-2Ce0Ds">Video</a>
-</h3>
-
-**TeraSim-World** automatically synthesizes geographically grounded, safety-critical data for End-to-End autonomous driving **anywhere in the world**. 
-
-✨ **Key Capabilities:**
-- 🗺️ **Global Coverage**: Generate realistic driving scenarios for any location worldwide
-- 🎯 **Safety-Critical Data**: Automatically create safety-critical events for E2E AV safety testing
-- 🔄 **NVIDIA Cosmos-Drive Compatible**: Direct integration with video generation model training platforms
-
-🚀 **Source code is now available!** See [TeraSim_World.md](docs/TeraSim_World.md) for getting started guide.
-
----
-
-## Key Capabilities
-
-### 1. High-Fidelity HD Map Generation
-
-* Tools for building **city-scale, high-resolution digital twins** suitable for AV testing.
-* Automated conversion of real-world survey data into simulation-ready HD maps.
-* Provides accurate lane geometry and traffic-control metadata for downstream simulations.
-
-### 2. Generative Traffic Environment Creation
-
-* Automated scenario generation based on **large-scale naturalistic driving data**.
-* **Adversarial scenario synthesis** to reveal rare or high-risk interactions (e.g., aggressive cut-ins, unexpected pedestrian crossings).
-* Integration with [SUMO](https://www.eclipse.org/sumo/) and third-party simulators such as [CARLA](https://carla.org/) and Autoware.
-
-### 3. Generative Sensor Simulation
-
-* **`terasim-cosmos`** integrates TeraSim-World with **generative AI–based camera and LiDAR simulation**.
-* Enables perception validation and sensor pipeline testing under diverse conditions.
-* **Ongoing work:** support for fully **custom sensor models and configurable realism levels** is under active development.
-
----
-
-## System Architecture
-
-TeraSim uses a modular monorepo design. Each package can be used independently or combined into a complete simulation pipeline.
-
-```
-TeraSim/
-├── packages/
-│   ├── terasim/            # Core simulation engine
-│   ├── terasim-envgen/     # HD map and environment generation
-│   ├── terasim-nde-nade/   # Naturalistic & adversarial environment algorithms
-│   ├── terasim-cosmos/     # TeraSim-World integration & generative AI sensor simulation
-│   ├── terasim-sensor/     # Baseline sensor utilities
-│   ├── terasim-datazoo/    # Data processing utilities for real driving datasets
-│   ├── terasim-service/    # RESTful API for external simulators
-│   └── terasim-vis/        # Visualization and analysis tools
-├── examples/               # Example configurations and scenarios
-├── docs/                   # Documentation and figures
-└── tests/                  # Test suites
-```
-
----
-
-## Installation
-
-### Quick Setup
+Everything map-specific (SUMO net, routes, adversity setup, run time) lives in a
+scenario YAML under `examples/scenarios/`, which you pass to the runner. Three
+maps ship with the repository: **Town01**, **Kashiwanoha** and **Mcity**.
 
 ```bash
-git clone https://github.com/mcity/TeraSim.git
-cd TeraSim
-conda create -n terasim python=3.10 -y
-conda activate terasim
+# Install (Python 3.10-3.12, gcc/g++ for the Cython extensions)
+conda create -n terasim python=3.10 -y && conda activate terasim
 ./setup_environment.sh
+
+# Standalone NADE run, on SUMO alone
+python scripts/run_experiments_debug.py --config examples/scenarios/Mcity_safety_assessment.yaml
+
+# Co-simulation against a running CARLA server
+python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01_dt005.yaml
 ```
 
-This script installs all required Python packages and dependencies, including [SUMO](https://www.eclipse.org/sumo/).
-
-<!-- ### Docker Installation (Recommended for Production)
-
-For a containerized environment with all dependencies pre-installed:
+For the full three-way setup, build the image and bring up the compose file,
+which runs `examples/scripts/run_3cosim_inprocess.sh` against a CARLA server
+that an Autoware bridge is already attached to:
 
 ```bash
-git clone https://github.com/mcity/TeraSim.git
-cd TeraSim
-docker-compose up -d --build
-docker-compose exec terasim bash
+docker build -f Dockerfile.cosim -t terasim-service:inprocess .
+SCENARIO=/app/examples/scenarios/cosim_town01_dt005.yaml \
+    docker compose -f docker-compose.cosim-inprocess.yml up
 ```
 
-See [README_DOCKER.md](README_DOCKER.md) for detailed Docker deployment instructions. -->
-
-**Requirements**
-
-* Python 3.10–3.12
-* SUMO 1.23.1 (installed by the setup script)
-* Redis for service components
-* gcc/g++ compilers (for Cython extensions)
-
----
-
-## Quick Start Example
-
-See [TeraSim_World.md](docs/TeraSim_World.md) for Quick Start Example.
-
-Additional examples are available in the [`examples/`](examples/) directory.
-
----
-
-## Contributing
-
-Contributions are welcome. Please read the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines and join the [GitHub discussions](https://github.com/mcity/TeraSim/discussions) for feedback or proposals.
-
----
-
-
-## Publications
-
-Explore our other research on autonomous driving testing!
-
-* **NDE** – Learning naturalistic driving environment with statistical realism
-  [Paper](https://doi.org/10.1038/s41467-023-37677-5) | [Code](https://github.com/michigan-traffic-lab/Learning-Naturalistic-Driving-Environment)
-
-* **NADE** – Intelligent driving intelligence test with naturalistic and adversarial environment
-  [Paper](https://doi.org/10.1038/s41467-021-21007-8) | [Code](https://github.com/michigan-traffic-lab/Naturalistic-and-Adversarial-Driving-Environment)
-
-* **D2RL** – Dense deep reinforcement learning for AV safety validation
-  [Paper](https://doi.org/10.1038/s41586-023-05732-2) | [Code](https://github.com/michigan-traffic-lab/Dense-Deep-Reinforcement-Learning)
+Physics-based background vehicles additionally need the patched SUMO build from
+`Dockerfile.sumo-external-state`, which layers onto the image above.
 
 ## **📄 License**
 

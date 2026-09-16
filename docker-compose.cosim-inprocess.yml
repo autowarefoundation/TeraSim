@@ -1,0 +1,53 @@
+# docker compose -f docker-compose.cosim-inprocess.yml up -d
+# =============================================================================
+# TeraSim side of the three-way co-simulation (Autoware x CARLA x TeraSim):
+# it injects background traffic into a running CARLA server. Single-process
+# variant -- the TeraSim loop and the CARLA client share one process, so there
+# is no transport, no extra port and no runner/client start-up ordering.
+#
+# Prerequisite: a CARLA server with the matching map, plus whatever drives the
+# ego vehicle (for example Autoware through a CARLA bridge), is already up.
+# Override TERASIM_IMAGE to run a different build.
+# =============================================================================
+services:
+  terasim-3cosim:
+    image: ${TERASIM_IMAGE:-terasim-service:inprocess}
+    container_name: terasim-3cosim
+    network_mode: host
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HOME=/tmp
+      - CARLA_HOST=${CARLA_HOST:-127.0.0.1}
+      - CARLA_PORT=${CARLA_PORT:-2000}
+      - SCENARIO=${SCENARIO:-/app/examples/scenarios/cosim_town01_dt005.yaml}
+      # Tick mode: follow (default) = the ego-side bridge owns world.tick() and
+      # TeraSim follows / master = TeraSim owns the clock and the bridge follows.
+      - COSIM_TICK_MODE=${COSIM_TICK_MODE:-follow}
+      # CARLA client RPC timeout in seconds. Raise it (e.g. 3600) when a freshly
+      # started server blocks inside its first world.tick() while warming up.
+      - CARLA_TIMEOUT=${CARLA_TIMEOUT:-600}
+      # Batch the per-actor transform and spawn RPCs into one request each.
+      # Per-actor RPCs dominate once there are hundreds of background vehicles.
+      - CARLA_COSIM_BATCH_TRANSFORM=${CARLA_COSIM_BATCH_TRANSFORM:-1}
+      - CARLA_COSIM_BATCH_SPAWN=${CARLA_COSIM_BATCH_SPAWN:-1}
+      # Mirror only the vehicles near the ego into CARLA. Off by default because
+      # the state filter below already narrows the state to the same neighbourhood.
+      - CARLA_COSIM_ACTOR_FILTER=${CARLA_COSIM_ACTOR_FILTER:-0}
+      # Build the TeraSim state from the vehicles near the ego only (on by
+      # default). Turns the per-step state cost from "proportional to the whole
+      # network" into "proportional to the neighbourhood", which is what keeps
+      # high vehicle counts real-time. Set to 0 for a whole-network state.
+      - TERASIM_COSIM_STATE_FILTER=${TERASIM_COSIM_STATE_FILTER:-1}
+      - TERASIM_COSIM_STATE_FILTER_RADIUS=${TERASIM_COSIM_STATE_FILTER_RADIUS:-300}
+      # Draw an "AV" label above the ego (one RPC per tick). Set to 0 for
+      # headless measurement runs.
+      - CARLA_COSIM_EGO_LABEL=${CARLA_COSIM_EGO_LABEL:-1}
+    volumes:
+      - ./examples:/app/examples
+      # terasim-service is installed editable in the image, so bind-mounting the
+      # sources runs the working tree without rebuilding (terasim and
+      # terasim-nde-nade stay as built into the image).
+      - ./packages/terasim-service/terasim_service:/app/packages/terasim-service/terasim_service
+    command: ["/bin/bash", "/app/examples/scripts/run_3cosim_inprocess.sh"]
+    restart: "no"

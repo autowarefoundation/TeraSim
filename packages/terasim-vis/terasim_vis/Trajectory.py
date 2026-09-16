@@ -364,7 +364,9 @@ class Trajectories:
         trajectories = dict()
         for timestep in root:
             time = float(timestep.attrib["time"])
-            if self.timestep is None and self.start is not None:
+            if self.timestep is None and self.start is not None and time > self.start:
+                # infer from the first timestep strictly after start; when the data
+                # begins exactly at start_time, "time - start" would yield 0
                 self.timestep = time - self.start
             if self.start is None:
                 self.start = time

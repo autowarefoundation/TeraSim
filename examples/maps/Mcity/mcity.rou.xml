@@ -2,8 +2,8 @@
 
     <!-- <vType id="IDM_waymo_motion" length="5.00" width="1.85" minGap="3.28" maxSpeed="10.00" carFollowModel="IDM" accel="1.84" decel="4.00" tau="1.17" emergencyDecel="9.0" lcAccelLat="20000.0" latAlignment="center" lcSublane="1" lcSpeedGain="0" lcKeepRight="0" lcCooperative="0" /> -->
 
-    <vType id="NDE_URBAN" length="5.00" width="1.85" minGap="3.28" maxSpeed="10.00" carFollowModel="IDM" accel="1.84" decel="1.29" tau="1.17" emergencyDecel="7.06" lcSpeedGain="0" lcCooperative="0" lcKeepRight="1" speedFactor="normc(1,0.1,0.8,1.2)"/>
-    <vType id="NDE_HIGHWAY" length="5.00" width="1.85" minGap="5.92" maxSpeed="28.31" carFollowModel="IDM" accel="5.95" decel="5.96" tau="1.72" emergencyDecel="7.06" lcSpeedGain="0" lcCooperative="0" lcKeepRight="1" speedFactor="normc(1,0.1,0.8,1.2)"/>
+    <vType id="NDE_URBAN" length="5.00" width="1.85" minGap="3.28" maxSpeed="10.00" carFollowModel="IDM" accel="1.84" decel="1.29" tau="1.17" emergencyDecel="7.06" lcSpeedGain="0.0001" lcCooperative="0" lcKeepRight="1" speedFactor="normc(1,0.1,0.8,1.2)"/>
+    <vType id="NDE_HIGHWAY" length="5.00" width="1.85" minGap="5.92" maxSpeed="28.31" carFollowModel="IDM" accel="5.95" decel="5.96" tau="1.72" emergencyDecel="7.06" lcSpeedGain="0.0001" lcCooperative="0" lcKeepRight="1" speedFactor="normc(1,0.1,0.8,1.2)"/>
     <route id="r_0" edges="EG_5_2_1 EG_5_2_11 EG_7_4_1 EG_7_4_2 EG_8_1_1 EG_9_1_1 EG_9_1_1.28 EG_21_1_1 EG_21_1_5 EG_20_1_11" />
     <route id="r_1" edges="EG_22_1_1 EG_21_1_14 EG_21_1_18 EG_9_1_23 EG_17_23_1 EG_17_23_1.16 EG_13_1_1 EG_7_1_1 EG_7_1_2 EG_5_1_1" />
     <route id="r_10" edges="EG_5_2_1 EG_5_2_11 EG_11_1_1 EG_16_1_5 EG_15_1_8 EG_15_1_17 EG_23_1_1" />
@@ -28,8 +28,7 @@
     <route id="r_21" edges="EG_1_3_1 EG_1_3_1.61 EG_1_3_1.136 EG_34_1_24 EG_34_1_3 gneE0 EG_4_1_1 EG_10_1_1 EG_15_1_17 EG_15_1_1 EG_16_23_1 EG_17_1_1 EG_17_1_1.17 EG_14_2_1 EG_14_2_1.5 EG_14_2_1.24 EG_9_1_1 EG_9_1_1.28 EG_21_1_1 EG_21_1_5 EG_20_1_11 EG_29_1_1" />
     <route id="r_22" edges="EG_25_2_1 EG_20_1_1 EG_21_1_10 EG_21_1_14 EG_21_1_18 EG_21_1_1 EG_21_1_5 EG_20_1_11" />
     <route id="r_23" edges="EG_22_1_1 EG_21_1_14 EG_21_1_18 EG_21_1_1 EG_21_1_5 EG_20_1_11" />
-    <route id="av_route" edges="EG_4_1_1 EG_10_1_1 EG_15_1_17 EG_15_1_1 EG_16_23_1 EG_17_1_1 EG_17_1_1.17 EG_14_2_1 EG_14_2_1.5 EG_14_2_1.24 EG_9_1_1 EG_9_1_1.28 EG_21_1_1 EG_21_1_5 EG_20_1_11 EG_29_1_1 EG_35_1_14" />
-    <!-- <route id="av_route" edges="EG_35_1_14 EG_1_3_1 EG_1_3_1.61 EG_1_3_1.136 EG_34_1_24 EG_34_1_3 gneE0 EG_4_1_1 EG_10_1_1 EG_15_1_17 EG_15_1_1 EG_16_23_1 EG_17_1_1 EG_17_1_1.17 EG_14_2_1 EG_14_2_1.5 EG_14_2_1.24 EG_9_1_1 EG_9_1_1.28 EG_21_1_1 EG_21_1_5 EG_20_1_11 EG_29_1_1 EG_35_1_14" /> -->
+    <route id="av_route" edges="EG_35_1_14 EG_1_3_1 EG_1_3_1.61 EG_1_3_1.136 EG_34_1_24 EG_34_1_3 gneE0 EG_4_1_1 EG_10_1_1 EG_15_1_17 EG_15_1_1 EG_16_23_1 EG_17_1_1 EG_17_1_1.17 EG_14_2_1 EG_14_2_1.5 EG_14_2_1.24 EG_9_1_1 EG_9_1_1.28 EG_21_1_1 EG_21_1_5 EG_20_1_11 EG_29_1_1 EG_35_1_14" />
 
     <flow id="BV_0" type="NDE_URBAN" begin="0.00" departLane="best" route="r_0" vehsPerHour="37" />
     <flow id="BV_1" type="NDE_URBAN" begin="0.00" departLane="best" route="r_1" vehsPerHour="67" />
@@ -94,12 +93,12 @@
         <walk edges="EG_17_1_1 EG_17_1_1.17 EG_19_1_1 EG_19_1_10 EG_25_2_7"/>
     </personFlow> -->
 
-    <vType id="vru_bike" vClass="bicycle" latAlignment="right" lcStrategic="0.5" />
+    <vType id="bike" vClass="bicycle" latAlignment="right" lcStrategic="0.5" />
 
     <route id="br_0" edges="EG_27_1_1 EG_17_1_1 EG_17_1_1.17 EG_19_1_1 EG_19_1_10 EG_25_2_7" />
     <!-- <route id="br_1" edges="EG_27_1_1 EG_17_1_1 EG_17_1_1.17 EG_14_2_1 EG_14_2_1.5 EG_14_2_1.24" /> -->
 
-    <flow id="BV_vru_bike_flow_0" type="vru_bike" begin="0.00" route="br_0" vehsPerHour="200" />
+    <flow id="BV_bike_flow_0" type="bike" begin="0.00" route="br_0" vehsPerHour="200" />
     <!-- <flow id="BV_bike_flow_1" type="bike" begin="0.00" route="br_1" vehsPerHour="200" /> -->
     <!-- <flow id="BV_bike_flow_2" type="bike" begin="0.00" route="r_23" vehsPerHour="200" /> -->
 

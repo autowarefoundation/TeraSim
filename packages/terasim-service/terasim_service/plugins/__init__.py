@@ -1,8 +1,8 @@
 from .base import BasePlugin
-from .cosim import TeraSimCoSimPlugin, DEFAULT_COSIM_PLUGIN_CONFIG
+from .cosim_inprocess import TeraSimCoSimInProcessPlugin, DEFAULT_COSIM_PLUGIN_CONFIG
 
 __all__ = [
-    "BasePlugin", 
-    "TeraSimCoSimPlugin",
+    "BasePlugin",
+    "TeraSimCoSimInProcessPlugin",
     "DEFAULT_COSIM_PLUGIN_CONFIG",
 ]

@@ -1,0 +1,3 @@
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <vType id="NDE_URBAN" length="5.00" width="1.85" minGap="3.28" maxSpeed="10.00" carFollowModel="IDM" accel="1.84" decel="1.29" tau="1.17" emergencyDecel="7.06" lcSpeedGain="0.0001" lcCooperative="0" lcKeepRight="1" speedFactor="normc(1,0.1,0.8,1.2)" />
+</routes>

@@ -10,6 +10,7 @@ import terasim.utils as utils
 from terasim.params import AgentType
 
 from .nade import NADE
+from ..vehicle.nde_controller import NDEController
 
 from ..utils import (
     apply_collision_avoidance,
@@ -30,6 +31,12 @@ class NADEWithAV(NADE):
         self.av_cfg = av_cfg
         self.cache_radius = 100 if "cache_radius" not in av_cfg else av_cfg.cache_radius
         self.control_radius = 50 if "control_radius" not in av_cfg else av_cfg.control_radius
+        max_controlled_bv = (
+            5 if "max_controlled_bv" not in av_cfg else av_cfg.max_controlled_bv
+        )
+        self.max_controlled_bv = max(0, int(max_controlled_bv))
+        self._controlled_bv_ids = set()
+        self._distance_tracking_vehicle_ids = []
         self.excluded_agent_set = set([AV_ID])
         self.insert_bv = False
         # AV control state management
@@ -72,7 +79,12 @@ class NADEWithAV(NADE):
             logger.info("Starting AV warmup phase...")
             self.execute_av_warmup()
             logger.info("AV warmup completed, external control activated")
-        
+
+        self._update_controlled_vehicle_context(ctx)
+        self.distance_info.before.update(
+            self.update_distance(self.get_distance_tracking_vehicle_ids())
+        )
+
         return True
 
     def add_av_unsafe(self, edge_id="EG_35_1_14", lane_id=None, position=0.0, speed=0.0):
@@ -108,13 +120,16 @@ class NADEWithAV(NADE):
             AV_ID,
             traci.constants.CMD_GET_VEHICLE_VARIABLE,
             self.cache_radius,
-            [traci.constants.VAR_DISTANCE],
+            [traci.constants.VAR_DISTANCE, traci.constants.VAR_POSITION],
         )
         if not self.av_debug_control:
             # Set SpeedMode and LaneChangeMode to 0 for external control
             traci.vehicle.setSpeedMode(AV_ID, 0)
             traci.vehicle.setLaneChangeMode(AV_ID, 0)
-        traci.vehicle.setSpeed(AV_ID, speed)
+            traci.vehicle.setSpeed(AV_ID, speed)
+        else:
+            # Hand back speed control to SUMO's car-following model
+            traci.vehicle.setSpeed(AV_ID, -1)
         
         # Set control mode to external
         self.av_control_mode = "external"
@@ -334,7 +349,7 @@ class NADEWithAV(NADE):
             AV_ID,
             traci.constants.CMD_GET_VEHICLE_VARIABLE,
             self.cache_radius,
-            [traci.constants.VAR_DISTANCE],
+            [traci.constants.VAR_DISTANCE, traci.constants.VAR_POSITION],
         )
         
         # Key: DO NOT set SpeedMode and LaneChangeMode to 0
@@ -493,28 +508,125 @@ class NADEWithAV(NADE):
         logger.info(f"AV control switched to EXTERNAL at edge {current_edge}, "
                    f"position {current_pos:.1f}m, speed {current_speed:.1f}m/s")
 
+    def get_distance_tracking_vehicle_ids(self):
+        """Return the bounded AV-neighborhood IDs used for distance logging."""
+        return list(self._distance_tracking_vehicle_ids)
+
+    def _step(self, simulator, ctx):
+        """Refresh AV-neighborhood control IDs before BaseEnv maintains agents."""
+        if ctx is None:
+            ctx = {}
+        self._update_controlled_vehicle_context(ctx)
+        return super()._step(simulator, ctx)
+
+    def _get_static_adversarial_object_ids(self):
+        static_adversity = getattr(self, "static_adversity", None)
+        static_adversarial_object_ids = []
+        if static_adversity is None or static_adversity.adversities is None:
+            return static_adversarial_object_ids
+
+        for adversity in static_adversity.adversities:
+            static_adversarial_object_ids.extend(
+                getattr(adversity, "_static_adversarial_object_id_list", [])
+            )
+        return static_adversarial_object_ids
+
+    def _update_controlled_vehicle_context(self, ctx):
+        if ctx is None:
+            ctx = {}
+
+        static_adversarial_object_ids = self._get_static_adversarial_object_ids()
+        static_adversarial_object_id_set = set(static_adversarial_object_ids)
+        vehicle_id_set = set(traci.vehicle.getIDList())
+
+        nearest_bv_ids = []
+        if AV_ID in vehicle_id_set:
+            nearest_bv_ids = self._select_nearest_bv_ids(
+                vehicle_id_set, static_adversarial_object_id_set
+            )
+            controlled_vehicle_ids = [AV_ID] + nearest_bv_ids
+        else:
+            controlled_vehicle_ids = []
+
+        self._release_departed_controlled_bvs(set(nearest_bv_ids), vehicle_id_set)
+        self._controlled_bv_ids = set(nearest_bv_ids)
+        self._distance_tracking_vehicle_ids = list(controlled_vehicle_ids)
+
+        ctx["terasim_controlled_vehicle_ids"] = controlled_vehicle_ids
+        ctx["static_adversarial_object_id_list"] = static_adversarial_object_ids
+        return controlled_vehicle_ids
+
+    def _select_nearest_bv_ids(self, vehicle_id_set, static_adversarial_object_id_set):
+        if self.max_controlled_bv <= 0:
+            return []
+
+        try:
+            av_context_subscription_results = (
+                traci.vehicle.getContextSubscriptionResults(AV_ID) or {}
+            )
+            av_position = np.array(traci.vehicle.getPosition(AV_ID)[:2], dtype=float)
+        except Exception as exc:
+            logger.debug(f"Unable to read AV context subscription results: {exc}")
+            return []
+
+        candidate_distances = []
+        for veh_id, subscription_values in av_context_subscription_results.items():
+            if (
+                veh_id == AV_ID
+                or veh_id in static_adversarial_object_id_set
+                or veh_id not in vehicle_id_set
+            ):
+                continue
+
+            position = None
+            if isinstance(subscription_values, dict):
+                position = subscription_values.get(traci.constants.VAR_POSITION)
+            if position is None:
+                try:
+                    position = traci.vehicle.getPosition(veh_id)
+                except Exception as exc:
+                    logger.debug(f"Unable to read position for candidate {veh_id}: {exc}")
+                    continue
+
+            distance = float(
+                np.linalg.norm(np.array(position[:2], dtype=float) - av_position)
+            )
+            if distance <= self.control_radius:
+                candidate_distances.append((veh_id, distance))
+
+        candidate_distances.sort(key=lambda item: (item[1], item[0]))
+        return [veh_id for veh_id, _ in candidate_distances[: self.max_controlled_bv]]
+
+    def _release_departed_controlled_bvs(self, next_bv_ids, vehicle_id_set):
+        for veh_id in self._controlled_bv_ids - next_bv_ids:
+            if veh_id in vehicle_id_set:
+                self._release_vehicle_to_sumo(veh_id)
+
+    def _release_vehicle_to_sumo(self, veh_id):
+        try:
+            traci.vehicle.setSpeed(veh_id, -1)
+        except Exception as exc:
+            logger.debug(f"Unable to hand speed control for {veh_id} back to SUMO: {exc}")
+
+        try:
+            NDEController.all_checks_on(veh_id)
+        except Exception as exc:
+            logger.debug(f"Unable to restore SUMO checks for {veh_id}: {exc}")
+
+        if veh_id in self.vehicle_list:
+            controller = self.vehicle_list[veh_id].controller
+            if hasattr(controller, "is_busy"):
+                controller.is_busy = False
+            if hasattr(controller, "cached_control_command"):
+                controller.cached_control_command = None
+
     def preparation(self):
         """Prepare for the NADE step."""
         super().preparation()
 
     @profile
     def NDE_decision(self, ctx):
-        if AV_ID in traci.vehicle.getIDList():
-            av_context_subscription_results = traci.vehicle.getContextSubscriptionResults(AV_ID)
-            tmp_terasim_controlled_vehicle_ids = list(av_context_subscription_results.keys())
-            # also exclude the static adversarial vehicles
-            static_adversarial_object_id_list = []
-            if self.static_adversity is not None and self.static_adversity.adversities is not None:
-                for adversity in self.static_adversity.adversities:
-                    for object_id in adversity._static_adversarial_object_id_list:
-                        static_adversarial_object_id_list.append(object_id)
-                        if object_id in tmp_terasim_controlled_vehicle_ids:
-                            tmp_terasim_controlled_vehicle_ids.remove(object_id)
-            self.simulator.ctx = {
-                "terasim_controlled_vehicle_ids": tmp_terasim_controlled_vehicle_ids,
-                "static_adversarial_object_id_list": static_adversarial_object_id_list,
-            }
-        return super().NDE_decision(self.simulator.ctx)
+        return super().NDE_decision(ctx)
 
     @profile
     def NADE_decision(self, env_command_information, env_observation):
@@ -596,8 +708,9 @@ class NADEWithAV(NADE):
             env_command_information (dict): Command information from the environment.
             env_observation (dict): Observation from the environment.
         """
-        if AV_ID in traci.vehicle.getIDList():
-            AV_control_command_cache = env_command_information[AgentType.VEHICLE][AV_ID]["command_cache"]
+        vehicle_command_information = env_command_information.get(AgentType.VEHICLE, {})
+        if AV_ID in traci.vehicle.getIDList() and AV_ID in vehicle_command_information:
+            AV_control_command_cache = vehicle_command_information[AV_ID]["command_cache"]
             (
                 nade_control_commands,
                 env_command_information,
@@ -628,6 +741,11 @@ class NADEWithAV(NADE):
                 nade_control_commands[AgentType.VEHICLE][AV_ID] = AV_control_command_cache
             self.execute_control_commands(nade_control_commands)
             self.record_step_data(env_command_information)
+        elif AV_ID in traci.vehicle.getIDList():
+            logger.warning(
+                "AV is in TraCI but not yet in env_command_information; "
+                "skipping NADE step this tick."
+            )
 
     def calculate_total_distance(self):
         """Calculate the total distance traveled by the AV.
@@ -799,7 +917,6 @@ class NADEWithAV(NADE):
         """
         num_colliding_vehicles = self.simulator.get_colliding_vehicle_number()
         colliding_vehicles = self.simulator.get_colliding_vehicles()
-        self._vehicle_in_env_distance("after")
         collision_objects = traci.simulation.getCollisions()
         collision_object_ids = traci.simulation.getCollidingVehiclesIDList()
         if num_colliding_vehicles >= 2 and "AV" in collision_object_ids:

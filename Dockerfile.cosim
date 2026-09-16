@@ -1,0 +1,61 @@
+# TeraSim Source Build for CARLA Co-Simulation
+# Builds terasim, terasim-nde-nade, terasim-service from monorepo source
+# Includes CARLA Python client for co-simulation
+
+FROM python:3.10-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies (build + runtime)
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    build-essential \
+    libspatialindex-dev \
+    libgeos-dev \
+    libproj-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    # X11/GL libs needed by SUMO binary
+    libx11-6 \
+    libxrender1 \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+WORKDIR /app
+
+# Copy only the packages needed for co-simulation
+COPY packages/terasim packages/terasim
+COPY packages/terasim-nde-nade packages/terasim-nde-nade
+COPY packages/terasim-service packages/terasim-service
+
+# Install packages in editable mode (order matters: terasim first as base dependency)
+RUN pip install --no-cache-dir -e packages/terasim && \
+    pip install --no-cache-dir -e packages/terasim-nde-nade && \
+    pip install --no-cache-dir -e packages/terasim-service
+
+# Install CARLA Python client (must match CARLA server version)
+RUN pip install --no-cache-dir carla==0.9.16
+
+# Build Cython extensions for NDE-NADE (collision detection, geometry, trajectory utils)
+RUN cd packages/terasim-nde-nade && \
+    python setup.py build_ext --inplace
+
+# Set SUMO_HOME to eclipse-sumo pip package location
+ENV SUMO_HOME=/usr/local/lib/python3.10/site-packages/sumo
+ENV PYTHONUNBUFFERED=1
+
+# Verify installation
+RUN python3 -c "import terasim; print('terasim OK')" && \
+    python3 -c "import terasim_nde_nade; print('terasim-nde-nade OK')" && \
+    python3 -c "import terasim_service; print('terasim-service OK')" && \
+    python3 -c "import carla; print('carla OK')"
+
+# Create output directory with open permissions
+RUN mkdir -p /app/outputs && chmod 777 /app/outputs
+
+CMD ["/bin/bash"]

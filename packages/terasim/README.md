@@ -67,7 +67,7 @@ TeraSim is built upon a series of foundational academic works in autonomous vehi
 
 TeraSim is modular, allowing users to **customize and extend** simulations easily. 
 
-![Architecture](docs/figure/TeraSim_architecture.svg)
+![Architecture](../../docs/figure/TeraSim_architecture.svg)
 
 
 📌 **Core Components:**  

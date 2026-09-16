@@ -12,11 +12,6 @@ DEFAULT_PLUGIN_CONFIG = {
     }
 }
 
-DEFAULT_REDIS_CONFIG = {
-    "host": "localhost",
-    "port": 6379,
-    "db": 0,
-}
 
 class BasePlugin(ABC):
     """Base class for plugin of TeraSim
@@ -25,7 +20,6 @@ class BasePlugin(ABC):
         self,
         simulation_uuid: str,
         plugin_config: dict = DEFAULT_PLUGIN_CONFIG,
-        redis_config: dict = DEFAULT_REDIS_CONFIG,
     ):
         """Initialize the base plugin.
         """
@@ -41,9 +35,6 @@ class BasePlugin(ABC):
         })
         # Plugin configuration
         self.plugin_config = plugin_config
-        # Redis connection configuration
-        self.redis_config = redis_config
-        self.redis_client = None
 
     def inject(self, simulator: Simulator, ctx):
         """Inject the plugin into the simulation.

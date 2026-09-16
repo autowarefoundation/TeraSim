@@ -6,19 +6,17 @@ This directory contains OpenDRIVE map files for the CARLA simulator and correspo
 
 ```
 examples/xodr_sumo_maps/
-├── carla_towns/
-│   ├── xodr/               # OpenDRIVE map files
-│   │   ├── Town01.xodr     # Basic city map (486KB)
-│   │   ├── Town02.xodr     # Small town map (602KB)
-│   │   ├── Town03.xodr     # Complex city map (2.2MB)
-│   │   ├── Town04.xodr     # Highway map (2.0MB)
-│   │   └── Town06.xodr     # Long highway map (2.0MB)
-│   ├── configs/            # SUMO simulation configuration files
-│   │   ├── Town01.sumocfg  # Town01 SUMO config
-│   │   ├── Town04.sumocfg  # Town04 SUMO config
-│   │   ├── Town05.sumocfg  # Town05 SUMO config
-│   │   └── carlavtypes.rou.xml  # CARLA vehicle type definitions
-│   └── sumo_net/           # SUMO network files (to be downloaded)
+├── xodr/                   # OpenDRIVE map files (converter input)
+│   ├── Town01.xodr         # Basic city map (486KB)
+│   ├── Town02.xodr         # Small town map (602KB)
+│   ├── Town03.xodr         # Complex city map (2.2MB)
+│   ├── Town04.xodr         # Highway map (2.0MB)
+│   ├── Town05.xodr         # Urban map (2.8MB)
+│   └── Town06.xodr         # Long highway map (2.0MB)
+├── sumo/                   # SUMO networks converted from the maps above
+│   ├── Town01.net.xml
+│   ├── Town04.net.xml
+│   └── Town05.net.xml
 └── README.md               # This file
 ```
 
@@ -51,20 +49,13 @@ examples/xodr_sumo_maps/
 - Features: long highway stretches with multiple exits/entrances
 - Use: long-range path planning, high-speed scenario testing
 
-## 🚗 CARLA-SUMO co-simulation
+## 🚗 Inspecting the converted networks
 
-### Configuration files
-- Town01.sumocfg: full SUMO configuration for Town01
-- Town04.sumocfg: SUMO configuration for the Town04 highway scenario
-- Town05.sumocfg: SUMO configuration for Town05 urban scenario
-- carlavtypes.rou.xml: CARLA vehicle type definitions, includes vehicle blueprint mappings
+The `sumo/` directory holds networks already converted from the maps above, so
+they can be opened without running the converter first:
 
-### Usage
 ```bash
-# Run CARLA-SUMO co-simulation
-cd carla_towns/configs
-sumo-gui -c Town01.sumocfg  # use the GUI
-sumo -c Town01.sumocfg      # headless / CLI mode
+sumo-gui -n examples/xodr_sumo_maps/sumo/Town01.net.xml
 ```
 
 ## 🛠️ Converter testing
@@ -72,20 +63,19 @@ sumo -c Town01.sumocfg      # headless / CLI mode
 ### Using the Python converter
 ```bash
 # Test basic map
-python python_opendrive_converter_v2.py examples/xodr_sumo_maps/carla_towns/xodr/Town01.xodr output_town01.net.xml
+python scripts/xodr_to_sumo_converter.py -i examples/xodr_sumo_maps/xodr/Town01.xodr -o output_town01.net.xml
 
 # Test highway map (includes ramps)
-python python_opendrive_converter_v2.py examples/xodr_sumo_maps/carla_towns/xodr/Town04.xodr output_town04.net.xml
+python scripts/xodr_to_sumo_converter.py -i examples/xodr_sumo_maps/xodr/Town04.xodr -o output_town04.net.xml
 
 # Test complex city map
-python python_opendrive_converter_v2.py examples/xodr_sumo_maps/carla_towns/xodr/Town03.xodr output_town03.net.xml
+python scripts/xodr_to_sumo_converter.py -i examples/xodr_sumo_maps/xodr/Town03.xodr -o output_town03.net.xml
 ```
 
 ### Comparison with the official netconvert
 ```bash
 # Use the official netconvert tool
-export SUMO_HOME=/home/mtl/.terasim/deps/sumo
-netconvert --opendrive-files examples/xodr_sumo_maps/carla_towns/xodr/Town01.xodr -o official_town01.net.xml
+netconvert --opendrive-files examples/xodr_sumo_maps/xodr/Town01.xodr -o official_town01.net.xml
 
 # Compare results
 sumo-gui -n output_town01.net.xml     # Python converter result

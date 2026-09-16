@@ -62,56 +62,6 @@ check_gcc_gpp() {
 }
 
 
-check_redis() {
-    log_info "Checking Redis service..."
-    if ! check_command redis-cli; then
-        log_warning "Redis not installed"
-        read -p "Install Redis? (y/n) " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-                sudo apt-get update
-                sudo apt-get install -y redis-server
-            elif [[ "$OSTYPE" == "darwin"* ]]; then
-                # macOS
-                if check_command brew; then
-                    brew install redis
-                else
-                    log_error "Please install Homebrew first or install Redis manually"
-                    exit 1
-                fi
-            else
-                log_error "Please install Redis manually: https://redis.io/download"
-                exit 1
-            fi
-        fi
-    fi
-    
-    # Check Redis service status (compatible with different systems)
-    if command -v systemctl &> /dev/null; then
-        if ! systemctl is-active --quiet redis-server 2>/dev/null; then
-            log_warning "Redis service not running"
-            read -p "Start Redis service? (y/n) " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                sudo systemctl start redis-server
-                log_info "Redis service started"
-            fi
-        else
-            log_info "Redis service is running"
-        fi
-    else
-        # macOS or other systems
-        if ! redis-cli ping &>/dev/null; then
-            log_warning "Redis not responding. Please start Redis manually"
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                log_info "On macOS, you can start Redis with: brew services start redis"
-            fi
-        else
-            log_info "Redis is responding"
-        fi
-    fi
-}
 
 setup_monorepo() {
     log_info "Setting up TeraSim monorepo..."
@@ -119,14 +69,10 @@ setup_monorepo() {
     # Initialize workspace and install dependencies
     log_info "Installing workspace packages..."
     # Install packages explicitly for conda compatibility
-    pip install waymo-open-dataset-tf-2-11-0
     pip install -e packages/terasim
     pip install -e packages/terasim-nde-nade
     pip install -e packages/terasim-service
-    pip install -e packages/terasim-envgen
-    pip install -e packages/terasim-datazoo
     pip install -e packages/terasim-vis
-    pip install -e packages/terasim-cosmos
 
     # Install development dependencies
     pip install "pytest>=7.4.0" "pytest-cov>=4.1.0" "black>=23.7.0" "ruff>=0.1.0" "mypy>=1.5.1" "isort>=5.12.0"
@@ -162,12 +108,6 @@ try:
     print('✅ TeraSim Visualization imported successfully')
 except ImportError:
     print('⚠️  TeraSim Visualization not available (optional)')
-
-try:
-    import terasim_cosmos
-    print('✅ TeraSim Cosmos imported successfully')
-except ImportError:
-    print('⚠️  TeraSim Cosmos not available (optional)')
 
 print(f'TeraSim version: 0.2.0')
 "
@@ -305,7 +245,6 @@ main() {
     
     check_python
     check_gcc_gpp
-    check_redis
     setup_sumo_tools
     setup_environment_variables
     setup_monorepo
@@ -324,10 +263,7 @@ packages = [
     ('terasim', 'Core simulation platform'),
     ('terasim_nde_nade', 'Neural differential equations enhancement'),
     ('terasim_vis', 'Visualization tools'),
-    ('terasim_envgen', 'Environment generation tools'),
-    ('terasim_datazoo', 'Data processing tools'),
-    ('terasim_service', 'Service API'),
-    ('terasim_cosmos', 'Cosmos-Drive integration')
+    ('terasim_service', 'Co-simulation link'),
 ]
 
 for pkg_name, description in packages:

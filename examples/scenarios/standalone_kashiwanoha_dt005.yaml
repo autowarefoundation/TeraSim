@@ -1,0 +1,113 @@
+# =============================================================================
+# Standalone TeraSim run on the Kashiwanoha map: background traffic only, no AV
+# and no adversity (every adversity probability is 0).
+#
+# Derived from cosim_kashiwanoha_dt005.yaml for standalone use (class NADE
+# instead of NADEWithAV, bounded run_time).
+#
+# Run:   python scripts/run_experiments_debug.py --config <this>   (no CARLA)
+# Video: render the fcd_all output with scripts/visualize_fcd.py
+#        (needs terasim-vis and ffmpeg)
+# =============================================================================
+environment:
+  class: NADE
+  module: terasim_nde_nade.envs
+  parameters:
+    AV_cfg:
+      cache_radius: 100
+      control_radius: 50
+      route:
+      - edge_27
+      - edge_62
+      - edge_42
+      - edge_14
+      - edge_13
+      - edge_39
+      - edge_40
+      - edge_45
+      - edge_46
+      - edge_63
+      - edge_21
+      - edge_66
+      - edge_67
+      - edge_20
+      - edge_19
+      - edge_57
+      - edge_77
+      type: NDE_URBAN
+    MOBIL_lc_flag: true
+    adversity_cfg:
+      vehicle:
+        intersection_cutin:
+          _convert_: all
+          _target_: terasim_nde_nade.adversity.vehicles.lanechange_adversity.LanechangeAdversity
+          ego_type: vehicle
+          location: intersection
+          predicted_collision_type: intersection_cutin
+          probability: 0
+        intersection_rearend:
+          _convert_: all
+          _target_: terasim_nde_nade.adversity.vehicles.leader_adversity.LeaderAdversity
+          ego_type: vehicle
+          location: intersection
+          predicted_collision_type: intersection_rearend
+          probability: 0
+        intersection_tfl:
+          _convert_: all
+          _target_: terasim_nde_nade.adversity.vehicles.trafficrule_adversity.TrafficRuleAdversity
+          ego_type: vehicle
+          location: intersection
+          predicted_collision_type: intersection_tfl
+          probability: 0
+      vulnerable_road_user:
+        jaywalking:
+          _convert_: all
+          _target_: terasim_nde_nade.adversity.vru.jaywalking_adversity.JaywalkingAdversity
+          ego_type: vulnerable_road_user
+          location: crosswalk
+          predicted_collision_type: intersection_jaywalking
+          probability: 0
+    adversity_sampling_probability: 1.0
+    drive_rule: lefthand
+    info_extractor: terasim.logger.infoextractor.InfoExtractor
+    log_flag: true
+    run_time: 300
+    stochastic_acc_flag: false
+    sumo_cfg_file_path: /app/examples/maps/kashiwanoha/kashiwanoha_dt005.sumocfg
+    sumo_net_file_path: /app/examples/maps/kashiwanoha/kashiwanoha.net.xml
+    vehicle_factory: terasim_nde_nade.vehicle.nde_vehicle_factory.NDEVehicleFactory
+    warmup_time_lb: 1
+    warmup_time_ub: 2
+input:
+  sumo_config_file: /app/examples/maps/kashiwanoha/kashiwanoha_dt005.sumocfg
+  sumo_net_file: /app/examples/maps/kashiwanoha/kashiwanoha.net.xml
+logging:
+  levels:
+  - TRACE
+  - INFO
+output:
+  aggregated_dir: aggregated
+  dir: /app/outputs
+  name: kashiwanoha_standalone
+  nth: '0_0'
+parameters:
+  num_cars: 8
+  simulation_time: 300
+seed: 42
+simulation_class: CarSimulation
+simulation_module: my_simulations
+simulation_type: safetest_kashiwanoha
+simulator:
+  class: Simulator
+  module: terasim.simulator
+  parameters:
+    gui_flag: false
+    num_tries: 10
+    realtime_flag: false
+    sumo_seed: 42
+    sumo_output_file_types:
+    - fcd_all
+    - collision
+    - tripinfo
+    traffic_scale: 4.0  # SUMO --scale: the trips file uses period 12 (2-3 vehicles
+    # at a time), which is too sparse to watch

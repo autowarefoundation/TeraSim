@@ -61,7 +61,12 @@ class NADE(BaseEnv):
             # self.static_adversity.initialize(time=utils.get_time())
         else:
             self.static_adversity = None
-        self.distance_info = Dict({"before": self.update_distance(), "after": Dict()})
+        self.distance_info = Dict(
+            {
+                "before": self.update_distance(self.get_distance_tracking_vehicle_ids()),
+                "after": Dict(),
+            }
+        )
         self.allow_NADE_IS = True
         self.latest_IS_time = -1
         self.centered_veh_id = None
@@ -72,7 +77,9 @@ class NADE(BaseEnv):
         """Prepare for the NADE step."""
         if self.static_adversity is not None:
             self.static_adversity.update(time=utils.get_time())
-        self.distance_info.after.update(self.update_distance())
+        self.distance_info.after.update(
+            self.update_distance(self.get_distance_tracking_vehicle_ids())
+        )
         self.record.final_time = utils.get_time()
         self.cache_history_tls_data()
     
@@ -236,7 +243,9 @@ class NADE(BaseEnv):
             bool: Flag to indicate if the simulation is successfully stopped.
         """
         if self.log_flag:
-            self.distance_info.after.update(self.update_distance())
+            self.distance_info.after.update(
+                self.update_distance(self.get_distance_tracking_vehicle_ids())
+            )
             self.record.weight = self.importance_sampling_weight
             self.record.total_distance = self.calculate_total_distance()
             logger.info(f"total distance: {self.record.total_distance}")
@@ -336,15 +345,38 @@ class NADE(BaseEnv):
         self.record.step_info[utils.get_time()] = step_log
         return step_log
 
-    def update_distance(self):
+    def get_distance_tracking_vehicle_ids(self):
+        """Return vehicle IDs to track for distance logging.
+
+        ``None`` preserves the historical NADE behavior of tracking every SUMO vehicle.
+        Subclasses can return a bounded ID list to avoid all-vehicle TraCI scans.
+        """
+        return None
+
+    def update_distance(self, vehicle_ids=None):
         """Update the distance information for all vehicles.
+
+        Args:
+            vehicle_ids (list, optional): Vehicle IDs to update. If None, update all vehicles.
 
         Returns:
             dict: Distance information for all vehicles.
         """
         distance_info_dict = Dict()
-        for veh_id in traci.vehicle.getIDList():
-            distance_info_dict[veh_id] = traci.vehicle.getDistance(veh_id)
+        if vehicle_ids is None:
+            vehicle_ids = traci.vehicle.getIDList()
+            skip_missing = False
+        else:
+            vehicle_ids = list(dict.fromkeys(vehicle_ids))
+            skip_missing = True
+
+        for veh_id in vehicle_ids:
+            try:
+                distance_info_dict[veh_id] = traci.vehicle.getDistance(veh_id)
+            except Exception:
+                if not skip_missing:
+                    raise
+                logger.debug(f"Skip distance update for missing vehicle {veh_id}")
         return distance_info_dict
 
 

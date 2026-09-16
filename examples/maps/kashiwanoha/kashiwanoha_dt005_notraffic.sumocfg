@@ -1,0 +1,27 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<configuration>
+
+    <input>
+        <net-file value="kashiwanoha.net.xml" />
+        <route-files value="kashiwanoha_empty.trips.xml" />
+        <step-length value="0.05" />
+    </input>
+
+    <time>
+        <begin value="0" />
+        <end value="36000" />
+    </time>
+
+    <random_number>
+        <random value="true" />
+    </random_number>
+
+    <processing>
+        <lateral-resolution value="0.8" />
+        <threads value="8" />
+        <time-to-teleport value="-1" />
+        <collision.action value="warn" />
+        <collision.check-junctions value="true" />
+        <collision.mingap-factor value="0" />
+    </processing>
+</configuration>

@@ -231,8 +231,10 @@ class TrafficVisualizer:
         # Configure trajectory colors and find target vehicle
         self.configure_trajectory_colors(ego_vehicle_id, adv_vehicle_id)
         
-        # Set trajectories timestep
-        self.trajectories.timestep = 0.1
+        # Set trajectories timestep (fall back to 0.1 only when the fcd did not yield one;
+        # a hardcoded 0.1 breaks downsampled or non-0.1 fcd inputs)
+        if not self.trajectories.timestep:
+            self.trajectories.timestep = 0.1
         print(f"Trajectories timestep: {self.trajectories.timestep}")
         print(f"Trajectories start: {self.trajectories.start}, end: {self.trajectories.end}")
         

@@ -28,7 +28,6 @@ TeraSim-NDE-NADE is the traffic environment for TeraSim, which is an advanced **
 ## 🏗 Code Architecture
 
 ### System Architecture
-![NDE-NADE Architecture](docs/figure/NDE-NADE-architecture.svg)
 
 ## 🔧 Installation & Configuration
 

@@ -1,7 +1,7 @@
 [project]
 name = "terasim-service"
 version = "0.2.0"
-description = "TeraSim service API and web interface"
+description = "TeraSim co-simulation link (single-process TeraSim + CARLA client)"
 authors = [
     {name = "Haowei Sun", email = "printfplus@outlook.com"},
 ]
@@ -11,19 +11,11 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "terasim>=0.2.0",
     "terasim-nde-nade>=0.2.0",    # Includes NDE-NADE enhancements
-    "fastapi>=0.115.8",
-    "uvicorn>=0.34.0",
     "pydantic>=2.10.6",
     "pyyaml>=6.0.2",
-    "redis>=5.2.1",
     "loguru>=0.7.3",
     "utm>=0.8.0",
-    "dash>=2.14.0",
-    "plotly>=5.18.0",
 ]
-
-[project.scripts]
-terasim-service = "terasim_service.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["terasim_service*"]

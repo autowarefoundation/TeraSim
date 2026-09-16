@@ -119,6 +119,11 @@ class OpenDriveToSumoConverter:
         
         # Lane mapping: (road_id, lane_id, direction) -> (edge_id, lane_index)
         self.lane_mapping: Dict[Tuple[str, int, str], Tuple[str, int]] = {}
+
+        # Traffic rule per road: road_id -> "RHT" | "LHT" (OpenDRIVE road @rule)
+        # LHT roads mirror the lane-direction convention: left lanes (id>0)
+        # travel along the reference line, right lanes (id<0) against it.
+        self.road_rules: Dict[str, str] = {}
         
         # Node counter
         self.node_counter = 0
@@ -168,6 +173,7 @@ class OpenDriveToSumoConverter:
         self._create_nodes()
         self._create_edges()
         self._create_connections()
+        self._create_direct_link_connections()
         
         # 3. Calculate and apply coordinate offset if we have geo reference
         if self.geo_reference:
@@ -193,6 +199,19 @@ class OpenDriveToSumoConverter:
             # First parse geoReference from XML (pyOpenDRIVE may not expose this)
             tree = ET.parse(xodr_file)
             root = tree.getroot()
+
+            # Traffic rule (RHT/LHT) per road - not exposed by pyOpenDRIVE either
+            self.road_rules = {
+                str(r.get('id')): (r.get('rule') or 'RHT').upper()
+                for r in root.findall('road')
+            }
+            lht_count = sum(1 for v in self.road_rules.values() if v == 'LHT')
+            if lht_count:
+                logger.info(
+                    f"LHT roads detected: {lht_count}/{len(self.road_rules)} - "
+                    "applying left-hand traffic lane-direction interpretation"
+                )
+
             geo_ref = root.find('.//geoReference')
             if geo_ref is not None:
                 self.geo_reference = geo_ref.text.strip() if geo_ref.text else None
@@ -487,8 +506,49 @@ class OpenDriveToSumoConverter:
             # Default to priority for simple junctions
             return "priority"
     
+    def _seed_junction_node_map(self):
+        """Pre-seed node_map so road endpoints that touch a junction resolve to
+        the junction node regardless of road processing order.
+
+        Covers two under-linked patterns seen in real maps:
+        1. a road whose own link declares the junction (seed its endpoint key so
+           chained road->road links of OTHER roads can find the junction node), and
+        2. incoming/outgoing roads that the junction only knows through its
+           connecting roads' links (the road's own link points at the next road
+           instead of the junction).
+        Without this, such endpoints get private nodes and the edge dead-ends.
+        """
+        # 1) Roads that directly declare a junction as predecessor/successor
+        for road_id, road in self.road_map.items():
+            if road.junction != '-1':
+                continue
+            if road.predecessor and road.predecessor.get('elementType') == 'junction':
+                self.node_map.setdefault(
+                    f"{road_id}_start", f"junction_{road.predecessor['elementId']}")
+            if road.successor and road.successor.get('elementType') == 'junction':
+                self.node_map.setdefault(
+                    f"{road_id}_end", f"junction_{road.successor['elementId']}")
+
+        # 2) Roads attached to a junction only via its connecting roads' links
+        for junction_id, connections in self.junction_connections.items():
+            junction_node = f"junction_{junction_id}"
+            for conn in connections:
+                connecting = self.road_map.get(conn.get('connectingRoad'))
+                if not connecting:
+                    continue
+                for link in (connecting.predecessor, connecting.successor):
+                    if link and link.get('elementType') == 'road':
+                        contact = link.get('contactPoint', 'start')
+                        self.node_map.setdefault(
+                            f"{link['elementId']}_{contact}", junction_node)
+
+        seeded = sum(1 for v in self.node_map.values()
+                     if str(v).startswith('junction_'))
+        logger.info(f"Seeded {seeded} road-endpoint -> junction-node mappings")
+
     def _create_nodes(self):
         """Create Plain XML nodes - one node per junction, regular nodes for road endpoints"""
+        self._seed_junction_node_map()
         # Collect all junction IDs referenced by roads
         referenced_junctions = set()
         junction_road_endpoints = {}  # junction_id -> list of (x, y, road_id, position)
@@ -514,20 +574,23 @@ class OpenDriveToSumoConverter:
                 pred_node_key = f"{pred_road_id}_{contact_point}"
                 current_node_key = f"{road_id}_start"
 
-                # Create node if it doesn't exist yet
-                if pred_node_key not in self.node_map:
+                # Adopt an existing mapping from either side before creating a
+                # new node (a side may be pre-seeded to a junction node)
+                if current_node_key in self.node_map:
+                    self.node_map.setdefault(pred_node_key, self.node_map[current_node_key])
+                elif pred_node_key in self.node_map:
+                    self.node_map[current_node_key] = self.node_map[pred_node_key]
+                else:
                     pred_road = self.road_map.get(pred_road_id)
                     if pred_road:
                         node = self._create_road_endpoint_node(pred_road, contact_point)
                         self.node_map[pred_node_key] = node
                         self.node_map[current_node_key] = node
-                else:
-                    # Node already exists, just link current road to it
-                    self.node_map[current_node_key] = self.node_map[pred_node_key]
             else:
-                # Create regular start node
-                start_node = self._create_road_endpoint_node(road, 'start')
-                self.node_map[f"{road_id}_start"] = start_node
+                # Create regular start node (unless already seeded, e.g. to a junction node)
+                if f"{road_id}_start" not in self.node_map:
+                    start_node = self._create_road_endpoint_node(road, 'start')
+                    self.node_map[f"{road_id}_start"] = start_node
 
             # Check successor
             if road.successor and road.successor['elementType'] == 'junction':
@@ -545,18 +608,21 @@ class OpenDriveToSumoConverter:
                 succ_node_key = f"{succ_road_id}_{contact_point}"
                 current_node_key = f"{road_id}_end"
 
-                # Create node if it doesn't exist yet
-                if current_node_key not in self.node_map:
+                # Adopt an existing mapping from either side before creating a
+                # new node (a side may be pre-seeded to a junction node)
+                if current_node_key in self.node_map:
+                    self.node_map.setdefault(succ_node_key, self.node_map[current_node_key])
+                elif succ_node_key in self.node_map:
+                    self.node_map[current_node_key] = self.node_map[succ_node_key]
+                else:
                     node = self._create_road_endpoint_node(road, 'end')
                     self.node_map[current_node_key] = node
                     self.node_map[succ_node_key] = node
-                # If current_node_key already exists, link successor to it
-                elif succ_node_key not in self.node_map:
-                    self.node_map[succ_node_key] = self.node_map[current_node_key]
             else:
-                # Create regular end node
-                end_node = self._create_road_endpoint_node(road, 'end')
-                self.node_map[f"{road_id}_end"] = end_node
+                # Create regular end node (unless already seeded, e.g. to a junction node)
+                if f"{road_id}_end" not in self.node_map:
+                    end_node = self._create_road_endpoint_node(road, 'end')
+                    self.node_map[f"{road_id}_end"] = end_node
         
         # Second pass: Create junction nodes from internal roads (if any)
         for junction_id, internal_road_ids in self.junction_roads.items():
@@ -1420,16 +1486,23 @@ class OpenDriveToSumoConverter:
             else:
                 shape_points = self._generate_road_shape(road)
             
-            # Create forward edge for right lanes (OpenDRIVE right lanes have negative IDs)
-            if road.lanes_right:
+            # Traffic-rule aware side interpretation:
+            # RHT: right lanes (id<0) run along s, left lanes (id>0) against s.
+            # LHT: mirrored - left lanes run along s, right lanes against s.
+            lht = self._is_lht(road_id)
+            forward_side_lanes = road.lanes_left if lht else road.lanes_right
+            backward_side_lanes = road.lanes_right if lht else road.lanes_left
+
+            # Create forward edge (runs along the reference line)
+            if forward_side_lanes:
                 edge_id = f"{road_id}.0"
                 # Prepare lane data with restrictions
                 lane_data = []
-                # Sort by ID ascending to map outer lanes to lower indices
-                # OpenDRIVE: -4 (outermost) to -1 (innermost)
-                # SUMO: index 0 (rightmost) to index n-1 (leftmost)
-                sorted_right_lanes = sorted(road.lanes_right, key=lambda x: x['id'])
-                for sumo_index, lane_info in enumerate(sorted_right_lanes):
+                # Sort so that the outermost (curb-side) lane gets SUMO index 0
+                # RHT forward = right lanes: -4 (outermost) ... -1 -> ascending
+                # LHT forward = left lanes: +4 (outermost) ... +1 -> descending
+                sorted_forward_lanes = sorted(forward_side_lanes, key=lambda x: x['id'], reverse=lht)
+                for sumo_index, lane_info in enumerate(sorted_forward_lanes):
                     lane_dict = {'width': lane_info.get('width', 3.66)}
                     # Set type and restrictions for shoulder lanes
                     lane_type = self._decode_if_bytes(lane_info['type'])
@@ -1448,7 +1521,7 @@ class OpenDriveToSumoConverter:
                     id=edge_id,
                     from_node=from_node,
                     to_node=to_node,
-                    num_lanes=len(road.lanes_right),
+                    num_lanes=len(forward_side_lanes),
                     speed=road.speed_limit,
                     name=road.name,
                     type=road.road_type,
@@ -1456,16 +1529,17 @@ class OpenDriveToSumoConverter:
                     lane_data=lane_data
                 ))
                 logger.debug(f"Created forward edge {edge_id}: {from_node} -> {to_node}")
-            
-            # Create backward edge for left lanes (OpenDRIVE left lanes have positive IDs)
-            if road.lanes_left:
+
+            # Create backward edge (runs against the reference line)
+            if backward_side_lanes:
                 edge_id = f"{road_id}.1"
                 # Reverse shape points for backward direction
                 reversed_shape = list(reversed(shape_points)) if shape_points else None
                 # Prepare lane data with restrictions
                 lane_data = []
-                sorted_left_lanes = sorted(road.lanes_left, key=lambda x: x['id'])
-                for sumo_index, lane_info in enumerate(sorted_left_lanes):
+                # Outermost lane -> SUMO index 0 (mirror of the forward case)
+                sorted_backward_lanes = sorted(backward_side_lanes, key=lambda x: x['id'], reverse=lht)
+                for sumo_index, lane_info in enumerate(sorted_backward_lanes):
                     lane_dict = {'width': lane_info.get('width', 3.66)}
                     # Set type and restrictions for shoulder lanes
                     lane_type = self._decode_if_bytes(lane_info['type'])
@@ -1484,7 +1558,7 @@ class OpenDriveToSumoConverter:
                     id=edge_id,
                     from_node=to_node,  # Note: direction is reversed
                     to_node=from_node,
-                    num_lanes=len(road.lanes_left),
+                    num_lanes=len(backward_side_lanes),
                     speed=road.speed_limit,
                     name=road.name,
                     type=road.road_type,
@@ -1843,7 +1917,7 @@ class OpenDriveToSumoConverter:
                     
                     # 🆕 use the global mapping table to find the SUMO lane indices
                     # 1. find the SUMO mapping of the incoming road
-                    incoming_direction = 'forward' if from_lane_id < 0 else 'backward'
+                    incoming_direction = self._lane_direction(incoming_road_id, from_lane_id)
                     from_mapping = self._get_sumo_lane_index(incoming_road_id, from_lane_id, incoming_direction)
                     
                     # 2. get the actual outgoing road lane ID
@@ -1860,7 +1934,7 @@ class OpenDriveToSumoConverter:
                         continue
                     
                     # 3. find the SUMO mapping of the outgoing road
-                    outgoing_direction = 'forward' if outgoing_lane_id < 0 else 'backward'
+                    outgoing_direction = self._lane_direction(outgoing_road_id, outgoing_lane_id)
                     to_mapping = self._get_sumo_lane_index(outgoing_road_id, outgoing_lane_id, outgoing_direction)
                     
                     if not from_mapping or not to_mapping:
@@ -1924,6 +1998,66 @@ class OpenDriveToSumoConverter:
         logger.info(f"  Failed: {failed_connections}")
         logger.info(f"Created {len(self.connections)} connections with via points")
     
+    def _create_direct_link_connections(self):
+        """Explicit connections for direct road->road links whose shared node is a
+        junction node.
+
+        netconvert treats a node's explicit connection list as exhaustive, so a
+        through-movement expressed as a plain road link (not present in the
+        junction's <connection> records) would otherwise be dropped and the
+        edge would dead-end at the junction. Plain (non-junction) shared nodes
+        are left alone - netconvert connects those automatically.
+        """
+        added = 0
+        edge_by_id = {e.id: e for e in self.edges}
+        existing = {(c.from_edge, c.to_edge) for c in self.connections}
+
+        def add_pairs(pairs):
+            nonlocal added
+            for fe, te in pairs:
+                if fe in edge_by_id and te in edge_by_id and (fe, te) not in existing:
+                    n = min(edge_by_id[fe].num_lanes, edge_by_id[te].num_lanes)
+                    for i in range(n):
+                        self.connections.append(PlainConnection(
+                            from_edge=fe, to_edge=te, from_lane=i, to_lane=i))
+                    existing.add((fe, te))
+                    added += 1
+
+        for road_id, road in self.road_map.items():
+            if road.junction != '-1':
+                continue
+            # A) this road's successor is a plain road link
+            succ = road.successor
+            if succ and succ.get('elementType') == 'road':
+                shared = self.node_map.get(f"{road_id}_end")
+                if shared and str(shared).startswith('junction_'):
+                    succ_id = succ['elementId']
+                    if succ.get('contactPoint', 'start') == 'start':
+                        # continue onto the successor along its s direction
+                        add_pairs([(f"{road_id}.0", f"{succ_id}.0"),
+                                   (f"{succ_id}.1", f"{road_id}.1")])
+                    else:
+                        # meets the successor's END: continue against its s direction
+                        add_pairs([(f"{road_id}.0", f"{succ_id}.1"),
+                                   (f"{succ_id}.0", f"{road_id}.1")])
+            # B) this road's predecessor is a plain road link (the other road may
+            #    itself link to a junction, so the pair only appears here)
+            pred = road.predecessor
+            if pred and pred.get('elementType') == 'road':
+                shared = self.node_map.get(f"{road_id}_start")
+                if shared and str(shared).startswith('junction_'):
+                    pred_id = pred['elementId']
+                    if pred.get('contactPoint', 'start') == 'end':
+                        # this road continues from the predecessor's end
+                        add_pairs([(f"{pred_id}.0", f"{road_id}.0"),
+                                   (f"{road_id}.1", f"{pred_id}.1")])
+                    else:
+                        # attached at the predecessor's START
+                        add_pairs([(f"{pred_id}.1", f"{road_id}.0"),
+                                   (f"{road_id}.1", f"{pred_id}.0")])
+        if added:
+            logger.info(f"Added {added} through-connections for direct road links at junction nodes")
+
     def _build_junction_connection_chains(self, junction_id: str) -> Dict[str, List[Dict]]:
         """
         Build complete connection chains for a junction
@@ -2146,6 +2280,18 @@ class OpenDriveToSumoConverter:
 
         logger.info(f"Created merge connections for junction {junction_id}")
     
+    def _is_lht(self, road_id) -> bool:
+        """True if the road is declared Left-Hand Traffic (OpenDRIVE road @rule)."""
+        return self.road_rules.get(str(road_id), 'RHT') == 'LHT'
+
+    def _lane_direction(self, road_id, lane_id: int) -> str:
+        """Travel direction of an OpenDRIVE lane relative to the reference line.
+
+        RHT: right lanes (id<0) run along s ('forward'), left lanes against.
+        LHT: mirrored - left lanes (id>0) run along s.
+        """
+        return 'forward' if ((lane_id < 0) != self._is_lht(road_id)) else 'backward'
+
     def _get_outgoing_road_from_connecting(self, connecting_road: OpenDriveRoad, contact_point: str) -> Optional[str]:
         """Get the outgoing road ID from a connecting road"""
         if connecting_road.successor and connecting_road.successor['elementType'] == 'road':
@@ -3142,6 +3288,11 @@ class OpenDriveToSumoConverter:
                 '--output.street-names', 'true',  # Preserve street names
                 '--output.original-names', 'true',  # Keep original IDs
             ]
+
+            # Left-hand traffic networks (e.g. Japan): build a lefthand SUMO net
+            if any(v == 'LHT' for v in self.road_rules.values()):
+                cmd.append('--lefthand')
+                logger.info("LHT roads present - running netconvert with --lefthand")
         
             
             # Add connections file if it exists

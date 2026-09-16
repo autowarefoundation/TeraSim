@@ -1,0 +1,733 @@
+diff --git a/src/libsumo/Helper.cpp b/src/libsumo/Helper.cpp
+index d0b6e8989..8b84f744c 100644
+--- a/src/libsumo/Helper.cpp
++++ b/src/libsumo/Helper.cpp
+@@ -1401 +1401 @@ Helper::setRemoteControlled(MSVehicle* v, Position xyPos, MSLane* l, double pos,
+-                            int edgeOffset, ConstMSEdgeVector route, SUMOTime t) {
++                            int edgeOffset, ConstMSEdgeVector route, SUMOTime t, bool strictLaneHint) {
+@@ -1403 +1403 @@ Helper::setRemoteControlled(MSVehicle* v, Position xyPos, MSLane* l, double pos,
+-    v->getInfluencer().setRemoteControlled(xyPos, l, pos, posLat, angle, edgeOffset, route, t);
++    v->getInfluencer().setRemoteControlled(xyPos, l, pos, posLat, angle, edgeOffset, route, t, strictLaneHint);
+@@ -1413,0 +1414,14 @@ Helper::setRemoteControlled(MSPerson* p, Position xyPos, MSLane* l, double pos,
++void
++Helper::applyRemoteControl(MSVehicle* v) {
++    const auto controlled = myRemoteControlledVehicles.find(v->getID());
++    if (controlled == myRemoteControlledVehicles.end()) {
++        throw TraCIException("Vehicle '" + v->getID() + "' has no pending remote-control state.");
++    }
++    controlled->second->getInfluencer().postProcessRemoteControl(
++        controlled->second, true);
++    controlled->second->getInfluencer().completeRemoteControl(
++        controlled->second, MSNet::getInstance()->getCurrentTimeStep());
++    myRemoteControlledVehicles.erase(controlled);
++}
++
++
+diff --git a/src/libsumo/Helper.h b/src/libsumo/Helper.h
+index 4737f08d6..2ab175cb2 100644
+--- a/src/libsumo/Helper.h
++++ b/src/libsumo/Helper.h
+@@ -155 +155 @@ public:
+-                                    int edgeOffset, ConstMSEdgeVector route, SUMOTime t);
++                                    int edgeOffset, ConstMSEdgeVector route, SUMOTime t, bool strictLaneHint = false);
+@@ -159,0 +160,3 @@ public:
++    /// @brief immediately apply and dequeue remote control for one vehicle
++    static void applyRemoteControl(MSVehicle* v);
++
+diff --git a/src/libsumo/TraCIConstants.h b/src/libsumo/TraCIConstants.h
+index fa301b9d6..c48bc7000 100644
+--- a/src/libsumo/TraCIConstants.h
++++ b/src/libsumo/TraCIConstants.h
+@@ -1109,0 +1110,3 @@ TRACI_CONST int MOVE_TO_XY = 0xb4;
++// immediately apply moveToXY position and angle without advancing time (set: vehicle)
++TRACI_CONST int MOVE_TO_XY_IMMEDIATE = 0xf8;
++
+diff --git a/src/libsumo/Vehicle.cpp b/src/libsumo/Vehicle.cpp
+index 239ef17be..c6a498097 100644
+--- a/src/libsumo/Vehicle.cpp
++++ b/src/libsumo/Vehicle.cpp
+@@ -21,0 +22 @@
++#include <cmath>
+@@ -1837,0 +1839,104 @@ Vehicle::moveToXY(const std::string& vehID, const std::string& edgeID, const int
++void
++Vehicle::moveToXYImmediate(const std::string& vehID, const std::string& edgeID, const int laneIndex,
++                           const double x, const double y, double angle,
++                          const int keepRoute, double matchThreshold, bool strictLaneHint) {
++    if (strictLaneHint
++            && (!std::isfinite(x)
++                || !std::isfinite(y)
++                || !std::isfinite(angle)
++                || !std::isfinite(matchThreshold))) {
++        throw TraCIException("Strict immediate moveToXY requires finite x, y, angle and match threshold.");
++    }
++
++    MSBaseVehicle* vehicle = Helper::getVehicle(vehID);
++    MSVehicle* veh = dynamic_cast<MSVehicle*>(vehicle);
++    if (veh == nullptr) {
++        WRITE_WARNING("moveToXYImmediate not yet implemented for meso");
++        return;
++    }
++    if (!strictLaneHint) {
++        moveToXY(vehID, edgeID, laneIndex, x, y, angle, keepRoute, matchThreshold);
++    } else {
++        MSEdge* hintEdge = MSEdge::dictionary(edgeID);
++        if (hintEdge == nullptr) {
++            throw TraCIException("Unknown strict immediate moveToXY edge '" + edgeID + "'.");
++        }
++        const std::vector<MSLane*>& lanes = hintEdge->getLanes();
++        if (laneIndex < 0 || laneIndex >= (int)lanes.size()) {
++            throw TraCIException("Invalid strict immediate moveToXY lane index " + toString(laneIndex)
++                                 + " for edge '" + edgeID + "'.");
++        }
++        MSLane* hintLane = lanes[laneIndex];
++        if (!veh->isOnRoad() || veh->getLane() != hintLane) {
++            throw TraCIException("Strict immediate moveToXY lane '" + hintLane->getID()
++                                 + "' does not match vehicle '" + vehID
++                                 + "' current route lane '" + Named::getIDSecure(veh->getLane()) + "'.");
++        }
++        if (matchThreshold < 0.) {
++            throw TraCIException("Strict immediate moveToXY match threshold must not be negative.");
++        }
++
++        Position pos(x, y);
++        pos.setz(veh->getPosition().z());
++        const double geometryPos2D = hintLane->getShape().nearest_offset_to_point2D(pos, false);
++        const double geometryPos25D = hintLane->getShape().nearest_offset_to_point25D(pos, false);
++        const double bestDistance = hintLane->getShape().distance2D(pos, false);
++        const Position extendedCoordinates =
++            hintLane->getShape().transformToVectorCoordinates(pos, true);
++        const double shapeLength = hintLane->getShape().length2D();
++        if (geometryPos2D == GeomHelper::INVALID_OFFSET
++                || geometryPos25D == GeomHelper::INVALID_OFFSET
++                || bestDistance == GeomHelper::INVALID_OFFSET
++                || extendedCoordinates == Position::INVALID
++                || !std::isfinite(extendedCoordinates.x())
++                || !std::isfinite(extendedCoordinates.y())
++                || !std::isfinite(shapeLength)
++                || bestDistance > matchThreshold) {
++            throw TraCIException("Could not strictly apply immediate moveToXY for vehicle '" + vehID
++                                 + "' to lane '" + hintLane->getID()
++                                 + "' within threshold " + toString(matchThreshold) + ".");
++        }
++        // Lane geometry length includes elevation. Use the same 2.5D offset
++        // as moveToXY so a sloped shape endpoint maps to the declared lane end.
++        const double lanePos = hintLane->interpolateGeometryPosToLanePos(geometryPos25D);
++        double lanePosLat = bestDistance;
++        const bool projectsToStart = geometryPos2D <= POSITION_EPS;
++        const bool projectsToEnd = geometryPos2D >= shapeLength - POSITION_EPS;
++        const bool outsideLongitudinalRange =
++            (projectsToStart && extendedCoordinates.x() < -NUMERICAL_EPS)
++            || (projectsToEnd && extendedCoordinates.x() > shapeLength + NUMERICAL_EPS);
++        if (outsideLongitudinalRange) {
++            // nearest_offset_to_point2D clamps to a finite shape endpoint.
++            // Keep endpoint overrun longitudinal instead of rotating it into posLat.
++            lanePosLat = -extendedCoordinates.y();
++        } else {
++            PositionVector leftShape = hintLane->getShape();
++            try {
++                leftShape.move2side(-lanePosLat);
++            } catch (ProcessError&) {
++                throw TraCIException("Could not determine strict immediate moveToXY lateral position on lane '"
++                                     + hintLane->getID() + "'.");
++            }
++            if (leftShape.distance2D(pos) > bestDistance) {
++                lanePosLat = -lanePosLat;
++            }
++        }
++        if (angle != INVALID_DOUBLE_VALUE) {
++            while (angle >= 360.) {
++                angle -= 360.;
++            }
++            while (angle < 0.) {
++                angle += 360.;
++            }
++        } else {
++            angle = GeomHelper::naviDegree(
++                        hintLane->getShape().rotationAtOffset(geometryPos2D));
++        }
++        Helper::setRemoteControlled(
++            veh, pos, hintLane, lanePos, lanePosLat, angle,
++            veh->getRoutePosition(), ConstMSEdgeVector(),
++            MSNet::getInstance()->getCurrentTimeStep(), true);
++    }
++    Helper::applyRemoteControl(veh);
++}
++
+diff --git a/src/libsumo/Vehicle.h b/src/libsumo/Vehicle.h
+index a733726bc..a67221f43 100644
+--- a/src/libsumo/Vehicle.h
++++ b/src/libsumo/Vehicle.h
+@@ -213,0 +214,3 @@ public:
++    static void moveToXYImmediate(const std::string& vehID, const std::string& edgeID, const int laneIndex,
++                                  const double x, const double y, double angle = libsumo::INVALID_DOUBLE_VALUE,
++                                 const int keepRoute = 1, double matchThreshold = 100, bool strictLaneHint = false);
+diff --git a/src/microsim/MSLaneChangerSublane.cpp b/src/microsim/MSLaneChangerSublane.cpp
+index 48248b2a6..f1f5fb7fb 100644
+--- a/src/microsim/MSLaneChangerSublane.cpp
++++ b/src/microsim/MSLaneChangerSublane.cpp
+@@ -117,0 +118,18 @@ MSLaneChangerSublane::change() {
++    double remotePhaseBSpeedLat = 0.;
++    if (vehicle->hasInfluencer()
++            && vehicle->getInfluencer().consumeRemoteLaneChangeSpeedRestore(
++                remotePhaseBSpeedLat)
++            && std::isfinite(remotePhaseBSpeedLat)) {
++        MSAbstractLaneChangeModel& laneChangeModel =
++            vehicle->getLaneChangeModel();
++        const double remainingManeuver = laneChangeModel.getManeuverDist();
++        const double maxRemainingSpeedLat = DIST2SPEED(remainingManeuver);
++        const bool restoreContinuesManeuver =
++            remotePhaseBSpeedLat * remainingManeuver > 0.;
++        const double boundedSpeedLat =
++            !restoreContinuesManeuver
++            ? 0.
++            : fabs(remotePhaseBSpeedLat) <= fabs(maxRemainingSpeedLat)
++              ? remotePhaseBSpeedLat : maxRemainingSpeedLat;
++        laneChangeModel.setSpeedLat(boundedSpeedLat);
++    }
+@@ -125,0 +144,37 @@ MSLaneChangerSublane::change() {
++    double remoteRebaseTargetPosLat = 0.;
++    const int remoteRebaseDirection = vehicle->hasInfluencer()
++                                      ? vehicle->getInfluencer().consumeRemoteLaneChangeRebase(
++                                            remoteRebaseTargetPosLat)
++                                      : 0;
++    if (remoteRebaseDirection != 0 && mayChange(remoteRebaseDirection)) {
++        ChangerIt to = myCandi + remoteRebaseDirection;
++        const bool remoteRebaseTraCI =
++            (vehicle->getLaneChangeModel().getOwnState() & LCA_TRACI) != 0;
++        if (checkChangeToNewLane(
++                vehicle, remoteRebaseDirection, myCandi, to)) {
++            MSAbstractLaneChangeModel& laneChangeModel =
++                vehicle->getLaneChangeModel();
++            const double currentPosLat = vehicle->getLateralPositionOnLane();
++            const double correction = remoteRebaseTargetPosLat - currentPosLat;
++            if (std::isfinite(correction)) {
++                vehicle->setLateralPositionOnLane(currentPosLat + correction);
++                vehicle->invalidateCachedPosition();
++                for (double& furtherPosLat : vehicle->myFurtherLanesPosLat) {
++                    furtherPosLat += correction;
++                }
++                laneChangeModel.updateSafeLatDist(correction);
++            }
++            const double rebasedManeuverDist = -remoteRebaseTargetPosLat;
++            laneChangeModel.setManeuverDist(rebasedManeuverDist);
++            if (remoteRebaseTraCI) {
++                vehicle->getInfluencer().setSublaneChange(
++                    rebasedManeuverDist);
++            }
++            laneChangeModel.updateShadowLane();
++            laneChangeModel.updateTargetLane();
++            vehicle->getInfluencer().invalidateRemoteControlHistory();
++            myCandi->lane->requireCollisionCheck();
++            to->lane->requireCollisionCheck();
++            return true;
++        }
++    }
+diff --git a/src/microsim/MSVehicle.cpp b/src/microsim/MSVehicle.cpp
+index 1792121ea..9e7482753 100644
+--- a/src/microsim/MSVehicle.cpp
++++ b/src/microsim/MSVehicle.cpp
+@@ -382,0 +383,14 @@ MSVehicle::Influencer::Influencer() :
++    myRemotePositionGeometrySign(0.),
++    myRemoteStrictLaneHint(false),
++    myRemotePrePhaseAOnRoad(false),
++    myRemotePrePhaseALane(nullptr),
++    myRemotePrePhaseAPosLat(0.),
++    myRemotePrePhaseASpeedLat(0.),
++    myExternalStateLane(nullptr),
++    myExternalStatePosLat(0.),
++    myExternalStateGeometrySign(0.),
++    myExternalStateTime(-1),
++    myRemoteLaneChangeRebaseDirection(0),
++    myRemoteLaneChangeRebaseTargetPosLat(0.),
++    myRemoteLaneChangeSpeedRestorePending(false),
++    myRemoteLaneChangeSpeedRestore(0.),
+@@ -817 +831 @@ void
+-MSVehicle::Influencer::setRemoteControlled(Position xyPos, MSLane* l, double pos, double posLat, double angle, int edgeOffset, const ConstMSEdgeVector& route, SUMOTime t) {
++MSVehicle::Influencer::setRemoteControlled(Position xyPos, MSLane* l, double pos, double posLat, double angle, int edgeOffset, const ConstMSEdgeVector& route, SUMOTime t, bool strictLaneHint) {
+@@ -825,0 +840 @@ MSVehicle::Influencer::setRemoteControlled(Position xyPos, MSLane* l, double pos
++    myRemoteStrictLaneHint = strictLaneHint;
+@@ -858 +873 @@ void
+-MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
++MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v, bool immediate) {
+@@ -860 +875,87 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
+-    const bool withinLane = myRemoteLane != nullptr && fabs(myRemotePosLat) < 0.5 * (myRemoteLane->getWidth() + v->getVehicleType().getWidth());
++    myRemotePrePhaseAOnRoad = wasOnRoad;
++    myRemotePrePhaseALane = wasOnRoad ? v->getLane() : nullptr;
++    myRemotePrePhaseAPosLat = wasOnRoad ? v->getLateralPositionOnLane() : 0.;
++    myRemotePrePhaseASpeedLat = wasOnRoad
++                               ? v->getLaneChangeModel().getSpeedLat() : 0.;
++    bool retainImmediatePrimary = false;
++    if (immediate
++            && !myRemoteStrictLaneHint
++            && MSGlobals::gLateralResolution > 0
++            && wasOnRoad
++            && myRemotePrePhaseALane != nullptr
++            && myRemoteLane != nullptr
++            && myRemotePrePhaseALane != myRemoteLane
++            && !myRemotePrePhaseALane->isInternal()
++            && !v->getLaneChangeModel().isOpposite()
++            && myRemoteRoute.empty()
++            && myRemoteEdgeOffset == v->getRoutePosition()) {
++        MSLane* sourceLane = v->getMutableLane();
++        const double maneuverDist =
++            v->getLaneChangeModel().getManeuverDist();
++        const int maneuverDirection = maneuverDist > 0. ? 1 : -1;
++        const int targetIndex = sourceLane->getIndex() + maneuverDirection;
++        const auto& sourceEdgeLanes = sourceLane->getEdge().getLanes();
++        const bool mapsManeuverTarget =
++            std::isfinite(maneuverDist)
++            && fabs(maneuverDist) > NUMERICAL_EPS
++            && &sourceLane->getEdge() == &myRemoteLane->getEdge()
++            && targetIndex >= 0
++            && targetIndex < (int)sourceEdgeLanes.size()
++            && sourceEdgeLanes[targetIndex] == myRemoteLane;
++        MSLane* shadowLane = v->getLaneChangeModel().getShadowLane();
++        const bool mapsShadowLane =
++            shadowLane != nullptr
++            && myRemoteLane == shadowLane
++            && &sourceLane->getEdge() == &shadowLane->getEdge();
++        if (mapsManeuverTarget || mapsShadowLane) {
++            const Position sourceCoordinates =
++                sourceLane->getShape().transformToVectorCoordinates(myRemoteXYPos);
++            const Position targetCoordinates =
++                myRemoteLane->getShape().transformToVectorCoordinates(myRemoteXYPos);
++            const double sourceGeometryPos25D =
++                sourceLane->getShape().nearest_offset_to_point25D(
++                    myRemoteXYPos, false);
++            const double defaultGeometrySign =
++                MSGlobals::gLefthand ? 1. : -1.;
++            const double sourcePosLat =
++                sourceCoordinates == Position::INVALID
++                ? 0. : sourceCoordinates.y() / defaultGeometrySign;
++            const bool withinManeuverTarget =
++                mapsManeuverTarget
++                && targetCoordinates != Position::INVALID
++                && std::isfinite(targetCoordinates.x())
++                && std::isfinite(targetCoordinates.y())
++                && fabs(targetCoordinates.y())
++                   <= 0.5 * myRemoteLane->getWidth() + POSITION_EPS;
++            const bool withinShadowEnvelope =
++                mapsShadowLane
++                && sourceCoordinates != Position::INVALID
++                && std::isfinite(sourcePosLat)
++                && fabs(sourcePosLat)
++                   < 0.5 * (sourceLane->getWidth()
++                            + v->getVehicleType().getWidth());
++            if (sourceCoordinates != Position::INVALID
++                    && sourceGeometryPos25D != GeomHelper::INVALID_OFFSET
++                    && std::isfinite(sourceCoordinates.x())
++                    && std::isfinite(sourceCoordinates.y())
++                    && std::isfinite(sourceGeometryPos25D)
++                    && (withinManeuverTarget || withinShadowEnvelope)) {
++                const double sourceLanePos =
++                    sourceLane->interpolateGeometryPosToLanePos(
++                        sourceGeometryPos25D);
++                if (std::isfinite(sourceLanePos)
++                        && std::isfinite(sourcePosLat)) {
++                    myRemoteLane = sourceLane;
++                    myRemotePos = sourceLanePos;
++                    myRemotePosLat = sourcePosLat;
++                    retainImmediatePrimary = true;
++                }
++            }
++        }
++    }
++    const bool withinLane = myRemoteLane != nullptr
++                            && (myRemoteStrictLaneHint
++                                || retainImmediatePrimary
++                                || fabs(myRemotePosLat)
++                                   < 0.5 * (myRemoteLane->getWidth()
++                                            + v->getVehicleType().getWidth()));
+@@ -886 +987,3 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
+-    v->myCurrEdge = v->getRoute().begin() + myRemoteEdgeOffset;
++    if (!myRemoteStrictLaneHint) {
++        v->myCurrEdge = v->getRoute().begin() + myRemoteEdgeOffset;
++    }
+@@ -933,0 +1037,200 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
++void
++MSVehicle::Influencer::completeRemoteControl(MSVehicle* v, SUMOTime t) {
++    myRemoteLaneChangeRebaseDirection = 0;
++    myRemoteLaneChangeRebaseTargetPosLat = 0.;
++    myRemoteLaneChangeSpeedRestorePending = false;
++    myRemoteLaneChangeSpeedRestore = 0.;
++    MSLane* completedLane = nullptr;
++    double completedPosLat = 0.;
++    double completedGeometrySign = 0.;
++    if (v->isOnRoad() && myRemoteLane != nullptr) {
++        // moveToXY reports the geometric lateral offset independently of the
++        // network drive side. First recover the geometry-side offset that
++        // reconstructs the external x/y state.
++        const double remotePosLat = v->getLateralPositionOnLane();
++        const double defaultGeometrySign = MSGlobals::gLefthand ? 1. : -1.;
++        const Position currentPos = myRemoteLane->geometryPositionAtOffset(
++                                        v->getPositionOnLane(), defaultGeometrySign * remotePosLat);
++        const Position flippedPos = myRemoteLane->geometryPositionAtOffset(
++                                        v->getPositionOnLane(), -defaultGeometrySign * remotePosLat);
++        double externalGeometrySign = defaultGeometrySign;
++        if (flippedPos != Position::INVALID
++                && (currentPos == Position::INVALID
++                    || flippedPos.distanceTo2D(myRemoteXYPos) < currentPos.distanceTo2D(myRemoteXYPos))) {
++            externalGeometrySign = -defaultGeometrySign;
++        }
++
++        // Lane indices normally follow the network drive side, but imported
++        // networks may contain the opposite geometric lane order. Determine
++        // the actual geometry direction of an index change from an adjacent
++        // lane so posLat remains meaningful to the lane-change model.
++        myRemotePositionGeometrySign = defaultGeometrySign;
++        const auto& edgeLanes = myRemoteLane->getEdge().getLanes();
++        const int laneIndex = myRemoteLane->getIndex();
++        const int neighborIndex = laneIndex + 1 < (int)edgeLanes.size()
++                                  ? laneIndex + 1
++                                  : laneIndex - 1;
++        if (neighborIndex >= 0 && neighborIndex < (int)edgeLanes.size()) {
++            const MSLane* neighborLane = edgeLanes[neighborIndex];
++            const double laneFraction = myRemoteLane->getLength() > 0.
++                                        ? v->getPositionOnLane() / myRemoteLane->getLength()
++                                        : 0.;
++            const double neighborPos = MIN2(neighborLane->getLength(),
++                                            MAX2(0., laneFraction * neighborLane->getLength()));
++            const Position neighborCenter = neighborLane->geometryPositionAtOffset(neighborPos);
++            const Position positiveProbe = myRemoteLane->geometryPositionAtOffset(
++                                               v->getPositionOnLane(), 0.5);
++            const Position negativeProbe = myRemoteLane->geometryPositionAtOffset(
++                                               v->getPositionOnLane(), -0.5);
++            if (neighborCenter != Position::INVALID
++                    && positiveProbe != Position::INVALID
++                    && negativeProbe != Position::INVALID) {
++                const double neighborDirection = neighborIndex > laneIndex ? 1. : -1.;
++                const double geometryDirection =
++                    positiveProbe.distanceTo2D(neighborCenter)
++                    < negativeProbe.distanceTo2D(neighborCenter) ? 1. : -1.;
++                myRemotePositionGeometrySign = geometryDirection * neighborDirection;
++            }
++        }
++        const double externalPosLat =
++            externalGeometrySign * remotePosLat / myRemotePositionGeometrySign;
++        v->setLateralPositionOnLane(externalPosLat);
++        completedLane = v->getLane() == myRemoteLane ? myRemoteLane : nullptr;
++        completedPosLat = externalPosLat;
++        completedGeometrySign = myRemotePositionGeometrySign;
++
++        // Vehicle further-lane occupancy may change when Phase A moves the rear
++        // across a lane boundary. Rebuild only position-dependent LC geometry.
++        MSAbstractLaneChangeModel& laneChangeModel = v->getLaneChangeModel();
++        const double maneuverDist = laneChangeModel.getManeuverDist();
++        const double externalAngle = v->getAngle();
++        const bool consecutivePhaseA =
++            MSGlobals::gLateralResolution > 0
++            && completedLane != nullptr
++            && myRemotePrePhaseAOnRoad
++            && myRemotePrePhaseALane == completedLane
++            && myExternalStateLane == completedLane
++            && myExternalStateGeometrySign == myRemotePositionGeometrySign
++            && myExternalStateTime + DELTA_T == t
++            && !completedLane->isInternal()
++            && !laneChangeModel.isOpposite()
++            && std::isfinite(myRemotePrePhaseAPosLat)
++            && std::isfinite(myRemotePrePhaseASpeedLat)
++            && std::isfinite(myExternalStatePosLat)
++            && std::isfinite(externalPosLat)
++            && std::isfinite(externalAngle)
++            && std::isfinite(maneuverDist);
++        if (consecutivePhaseA) {
++            const double realized = externalPosLat - myExternalStatePosLat;
++            if (std::isfinite(realized)) {
++                const int maneuverDirection = maneuverDist > 0. ? 1 : -1;
++                const int targetIndex = laneIndex + maneuverDirection;
++                MSLane* authorizedTargetLane = nullptr;
++                double authorizedTargetPosLat = 0.;
++                if (fabs(maneuverDist) > NUMERICAL_EPS
++                        && targetIndex >= 0
++                        && targetIndex < (int)edgeLanes.size()) {
++                    MSLane* candidate = edgeLanes[targetIndex];
++                    if (candidate->getIndex() == targetIndex
++                            && &candidate->getEdge() == &completedLane->getEdge()) {
++                        const Position targetCoordinates =
++                            candidate->getShape().transformToVectorCoordinates(myRemoteXYPos);
++                        if (targetCoordinates != Position::INVALID
++                                && std::isfinite(targetCoordinates.x())
++                                && std::isfinite(targetCoordinates.y())) {
++                            authorizedTargetLane = candidate;
++                            authorizedTargetPosLat =
++                                targetCoordinates.y() / myRemotePositionGeometrySign;
++                        }
++                    }
++                }
++                const bool withinTargetLane =
++                    authorizedTargetLane != nullptr
++                    && maneuverDirection * externalPosLat
++                    > 0.5 * completedLane->getWidth()
++                    && fabs(authorizedTargetPosLat)
++                    <= 0.5 * authorizedTargetLane->getWidth() + POSITION_EPS;
++                const bool hasActiveManeuver =
++                    fabs(maneuverDist) > NUMERICAL_EPS;
++                laneChangeModel.setSpeedLat(DIST2SPEED(realized));
++                if (hasActiveManeuver) {
++                    myRemoteLaneChangeSpeedRestore = myRemotePrePhaseASpeedLat;
++                    myRemoteLaneChangeSpeedRestorePending = true;
++                    const double simulated =
++                        myRemotePrePhaseAPosLat - myExternalStatePosLat;
++                    const double correction = realized - simulated;
++                    if (std::isfinite(simulated) && std::isfinite(correction)) {
++                        laneChangeModel.updateSafeLatDist(correction);
++                        const double correctedManeuverDist =
++                            maneuverDist - correction;
++                        const int ownState = laneChangeModel.getOwnState();
++                        const bool traciLeft =
++                            (ownState & (LCA_TRACI | LCA_LEFT))
++                            == (LCA_TRACI | LCA_LEFT);
++                        const bool traciRight =
++                            (ownState & (LCA_TRACI | LCA_RIGHT))
++                            == (LCA_TRACI | LCA_RIGHT);
++                        const bool contradictsTraCIDirection =
++                            traciLeft != traciRight
++                            && ((traciLeft && correctedManeuverDist < 0.)
++                                || (traciRight && correctedManeuverDist > 0.));
++                        const double synchronizedManeuverDist =
++                            contradictsTraCIDirection
++                            ? 0. : correctedManeuverDist;
++                        laneChangeModel.setManeuverDist(
++                            synchronizedManeuverDist);
++                        if ((laneChangeModel.getOwnState() & LCA_TRACI) != 0) {
++                            setSublaneChange(synchronizedManeuverDist);
++                        }
++                        for (double& furtherPosLat : v->myFurtherLanesPosLat) {
++                            furtherPosLat += correction;
++                        }
++                        if (withinTargetLane) {
++                            myRemoteLaneChangeRebaseDirection = maneuverDirection;
++                            myRemoteLaneChangeRebaseTargetPosLat = authorizedTargetPosLat;
++                        }
++                    }
++
++                } else {
++                    myRemoteLaneChangeSpeedRestorePending = false;
++                    myRemoteLaneChangeSpeedRestore = 0.;
++                }
++
++                const double phaseAComputedAngle = v->computeAngle();
++                const double phaseAComputedOffset =
++                    laneChangeModel.getAngleOffset();
++                const double laneBaseline =
++                    phaseAComputedAngle
++                    + myRemotePositionGeometrySign * phaseAComputedOffset;
++                const double externalOffset =
++                    myRemotePositionGeometrySign
++                    * GeomHelper::angleDiff(externalAngle, laneBaseline);
++                if (std::isfinite(phaseAComputedAngle)
++                        && std::isfinite(phaseAComputedOffset)
++                        && std::isfinite(laneBaseline)
++                        && std::isfinite(externalOffset)) {
++                    laneChangeModel.setAngleOffset(externalOffset);
++                    laneChangeModel.setPreviousAngleOffset(externalOffset);
++                }
++            }
++        }
++        if (MSGlobals::gLateralResolution > 0) {
++            laneChangeModel.updateShadowLane();
++            laneChangeModel.updateTargetLane();
++        } else if (MSGlobals::gLaneChangeDuration > 0) {
++            laneChangeModel.updateShadowLane();
++        }
++    }
++    myExternalStateLane = completedLane;
++    myExternalStatePosLat = completedPosLat;
++    myExternalStateGeometrySign = completedGeometrySign;
++    myExternalStateTime = t;
++    if (myLastRemoteAccess == t) {
++        // Keep wasRemoteControlled() true while ensuring that planning in a
++        // simulationStep at the same timestamp no longer treats the vehicle
++        // as being controlled by a pending moveToXY command.
++        myLastRemoteAccess = t - 1;
++    }
++}
++
++
+@@ -1247,0 +1551,12 @@ MSVehicle::getSlope() const {
++double
++MSVehicle::getLateralGeometrySign() const {
++    if (myInfluencer != nullptr) {
++        const double remoteSign = myInfluencer->getRemotePositionGeometrySign();
++        if (remoteSign != 0.) {
++            return remoteSign;
++        }
++    }
++    return MSGlobals::gLefthand ? 1. : -1.;
++}
++
++
+@@ -1272 +1587 @@ MSVehicle::getPosition(const double offset) const {
+-    const double posLat = (MSGlobals::gLefthand ? 1 : -1) * getLateralPositionOnLane();
++    const double posLat = getLateralGeometrySign() * getLateralPositionOnLane();
+@@ -1482,2 +1797,2 @@ MSVehicle::computeAngle() const {
+-    const double posLat = -myState.myPosLat; // @todo get rid of the '-'
+-    const double lefthandSign = (MSGlobals::gLefthand ? -1 : 1);
++    const double geometrySign = getLateralGeometrySign();
++    const double posLat = geometrySign * myState.myPosLat;
+@@ -1499 +1814 @@ MSVehicle::computeAngle() const {
+-        p1 = myLane->geometryPositionAtOffset(myState.myPos, lefthandSign * posLat);
++        p1 = myLane->geometryPositionAtOffset(myState.myPos, posLat);
+@@ -1503 +1818 @@ MSVehicle::computeAngle() const {
+-            p1 = predecessorLane->geometryPositionAtOffset(predecessorLane->getLength() + myState.myPos, lefthandSign * posLat);
++            p1 = predecessorLane->geometryPositionAtOffset(predecessorLane->getLength() + myState.myPos, posLat);
+@@ -1532 +1847 @@ MSVehicle::computeAngle() const {
+-    result += lefthandSign * myLaneChangeModel->calcAngleOffset();
++    result -= geometrySign * myLaneChangeModel->calcAngleOffset();
+@@ -1545 +1860,2 @@ MSVehicle::getBackPosition() const {
+-    const double posLat = MSGlobals::gLefthand ? myState.myPosLat : -myState.myPosLat;
++    const double geometrySign = getLateralGeometrySign();
++    const double posLat = geometrySign * myState.myPosLat;
+@@ -1568 +1884 @@ MSVehicle::getBackPosition() const {
+-                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, -myFurtherLanesPosLat.back() * (MSGlobals::gLefthand ? -1 : 1));
++                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, geometrySign * myFurtherLanesPosLat.back());
+diff --git a/src/microsim/MSVehicle.h b/src/microsim/MSVehicle.h
+index 05b62c06a..988fd5c3e 100644
+--- a/src/microsim/MSVehicle.h
++++ b/src/microsim/MSVehicle.h
+@@ -566,0 +567,3 @@ public:
++    /// @brief geometry-side multiplier for the internal lateral lane position
++    double getLateralGeometrySign() const;
++
+@@ -1561 +1564 @@ public:
+-        void setRemoteControlled(Position xyPos, MSLane* l, double pos, double posLat, double angle, int edgeOffset, const ConstMSEdgeVector& route, SUMOTime t);
++        void setRemoteControlled(Position xyPos, MSLane* l, double pos, double posLat, double angle, int edgeOffset, const ConstMSEdgeVector& route, SUMOTime t, bool strictLaneHint = false);
+@@ -1571 +1574,8 @@ public:
+-        void postProcessRemoteControl(MSVehicle* v);
++        void postProcessRemoteControl(MSVehicle* v, bool immediate = false);
++
++        /// @brief normalize and mark an already-applied remote-control update as complete
++        void completeRemoteControl(MSVehicle* v, SUMOTime t);
++
++        double getRemotePositionGeometrySign() const {
++            return myRemotePositionGeometrySign;
++        }
+@@ -1572,0 +1583,23 @@ public:
++
++        int consumeRemoteLaneChangeRebase(double& targetPosLat) {
++            const int direction = myRemoteLaneChangeRebaseDirection;
++            targetPosLat = myRemoteLaneChangeRebaseTargetPosLat;
++            myRemoteLaneChangeRebaseDirection = 0;
++            myRemoteLaneChangeRebaseTargetPosLat = 0.;
++            return direction;
++        }
++
++        bool consumeRemoteLaneChangeSpeedRestore(double& speedLat) {
++            const bool pending = myRemoteLaneChangeSpeedRestorePending;
++            speedLat = myRemoteLaneChangeSpeedRestore;
++            myRemoteLaneChangeSpeedRestorePending = false;
++            myRemoteLaneChangeSpeedRestore = 0.;
++            return pending;
++        }
++
++        void invalidateRemoteControlHistory() {
++            myExternalStateLane = nullptr;
++            myExternalStateTime = -1;
++            myRemoteLaneChangeSpeedRestorePending = false;
++            myRemoteLaneChangeSpeedRestore = 0.;
++        }
+@@ -1656,0 +1690,14 @@ public:
++        double myRemotePositionGeometrySign;
++        bool myRemoteStrictLaneHint;
++        bool myRemotePrePhaseAOnRoad;
++        const MSLane* myRemotePrePhaseALane;
++        double myRemotePrePhaseAPosLat;
++        double myRemotePrePhaseASpeedLat;
++        const MSLane* myExternalStateLane;
++        double myExternalStatePosLat;
++        double myExternalStateGeometrySign;
++        SUMOTime myExternalStateTime;
++        int myRemoteLaneChangeRebaseDirection;
++        double myRemoteLaneChangeRebaseTargetPosLat;
++        bool myRemoteLaneChangeSpeedRestorePending;
++        double myRemoteLaneChangeSpeedRestore;
+diff --git a/src/traci-server/TraCIServerAPI_Vehicle.cpp b/src/traci-server/TraCIServerAPI_Vehicle.cpp
+index a161772c8..911bfbd27 100644
+--- a/src/traci-server/TraCIServerAPI_Vehicle.cpp
++++ b/src/traci-server/TraCIServerAPI_Vehicle.cpp
+@@ -117 +117 @@ TraCIServerAPI_Vehicle::processSet(TraCIServer& server, tcpip::Storage& inputSto
+-            && variable != libsumo::MOVE_TO_XY && variable != libsumo::VAR_PARAMETER/* && variable != libsumo::VAR_SPEED_TIME_LINE && variable != libsumo::VAR_LANE_TIME_LINE*/
++            && variable != libsumo::MOVE_TO_XY && variable != libsumo::MOVE_TO_XY_IMMEDIATE && variable != libsumo::VAR_PARAMETER/* && variable != libsumo::VAR_SPEED_TIME_LINE && variable != libsumo::VAR_LANE_TIME_LINE*/
+@@ -838,0 +839,52 @@ TraCIServerAPI_Vehicle::processSet(TraCIServer& server, tcpip::Storage& inputSto
++            case libsumo::MOVE_TO_XY_IMMEDIATE: {
++                if (inputStorage.readUnsignedByte() != libsumo::TYPE_COMPOUND) {
++                    return server.writeErrorStatusCmd(libsumo::CMD_SET_VEHICLE_VARIABLE,
++                                                      "moveToXYImmediate requires a compound object.", outputStorage);
++                }
++                const int numArgs = inputStorage.readInt();
++                if (numArgs != 7 && numArgs != 8) {
++                    return server.writeErrorStatusCmd(libsumo::CMD_SET_VEHICLE_VARIABLE,
++                                                      "moveToXYImmediate requires edgeID, lane, x, y, angle, keepRouteFlag, matchThreshold and optional strictLaneHint.", outputStorage);
++                }
++                std::string edgeID;
++                if (!server.readTypeCheckingString(inputStorage, edgeID)) {
++                    return server.writeErrorStatusCmd(libsumo::CMD_SET_VEHICLE_VARIABLE,
++                                                      "The first parameter for moveToXYImmediate must be the edge ID given as a string.", outputStorage);
++                }
++                const int laneIndex = StoHelp::readTypedInt(inputStorage,
++                                      "The second parameter for moveToXYImmediate must be lane given as an int.");
++                double x = 0;
++                if (!server.readTypeCheckingDouble(inputStorage, x)) {
++                    return server.writeErrorStatusCmd(libsumo::CMD_SET_VEHICLE_VARIABLE,
++                                                      "The third parameter for moveToXYImmediate must be the x-position given as a double.", outputStorage);
++                }
++                double y = 0;
++                if (!server.readTypeCheckingDouble(inputStorage, y)) {
++                    return server.writeErrorStatusCmd(libsumo::CMD_SET_VEHICLE_VARIABLE,
++                                                      "The fourth parameter for moveToXYImmediate must be the y-position given as a double.", outputStorage);
++                }
++                double angle = 0;
++                if (!server.readTypeCheckingDouble(inputStorage, angle)) {
++                    return server.writeErrorStatusCmd(libsumo::CMD_SET_VEHICLE_VARIABLE,
++                                                      "The fifth parameter for moveToXYImmediate must be the angle given as a double.", outputStorage);
++                }
++                int keepRouteFlag = 1;
++                if (!server.readTypeCheckingByte(inputStorage, keepRouteFlag)) {
++                    return server.writeErrorStatusCmd(libsumo::CMD_SET_VEHICLE_VARIABLE,
++                                                      "The sixth parameter for moveToXYImmediate must be the keepRouteFlag given as a byte.", outputStorage);
++                }
++                double matchThreshold = 100;
++                if (!server.readTypeCheckingDouble(inputStorage, matchThreshold)) {
++                    return server.writeErrorStatusCmd(libsumo::CMD_SET_VEHICLE_VARIABLE,
++                                                      "The seventh parameter for moveToXYImmediate must be the matchThreshold given as a double.", outputStorage);
++                }
++                int strictLaneHint = 0;
++                if (numArgs == 8
++                        && !server.readTypeCheckingByte(inputStorage, strictLaneHint)) {
++                    return server.writeErrorStatusCmd(libsumo::CMD_SET_VEHICLE_VARIABLE,
++                                                      "The eighth parameter for moveToXYImmediate must be strictLaneHint given as a byte.", outputStorage);
++                }
++                libsumo::Vehicle::moveToXYImmediate(id, edgeID, laneIndex, x, y, angle,
++                                                    keepRouteFlag, matchThreshold, strictLaneHint != 0);
++            }
++            break;
+diff --git a/tools/traci/_vehicle.py b/tools/traci/_vehicle.py
+index 94c00f2e5..558874100 100644
+--- a/tools/traci/_vehicle.py
++++ b/tools/traci/_vehicle.py
+@@ -1493,0 +1494,17 @@ class VehicleDomain(VTypeDomain):
++    @alias_param("laneIndex", "lane")
++    def moveToXYImmediate(self, vehID, edgeID, laneIndex, x, y,
++                          angle=tc.INVALID_DOUBLE_VALUE, keepRoute=1,
++                          matchThreshold=100, strictLaneHint=False):
++        '''Immediately apply a moveToXY position and angle without advancing
++        simulation time. The resulting pose is used as the initial state of
++        the next simulationStep.
++        strictLaneHint constrains matching to the supplied primary lane and
++        fails if that lane is not the vehicle's current route lane.
++        '''
++        if strictLaneHint:
++            self._setCmd(tc.MOVE_TO_XY_IMMEDIATE, vehID, "tsidddbdb", 8, edgeID, laneIndex,
++                         x, y, angle, keepRoute, matchThreshold, True)
++        else:
++            self._setCmd(tc.MOVE_TO_XY_IMMEDIATE, vehID, "tsidddbd", 7, edgeID, laneIndex,
++                         x, y, angle, keepRoute, matchThreshold)
++
+diff --git a/tools/traci/constants.py b/tools/traci/constants.py
+index 918866a98..dfd4987f6 100644
+--- a/tools/traci/constants.py
++++ b/tools/traci/constants.py
+@@ -1090,0 +1091,3 @@ MOVE_TO_XY = 0xb4
++#  immediately apply moveToXY position and angle without advancing time (set: vehicle)
++MOVE_TO_XY_IMMEDIATE = 0xf8
++

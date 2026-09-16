@@ -2,12 +2,25 @@ import carla
 import logging
 import math
 import pyproj
+import time
 import utm
 
 
 ZONE_NUMBER = 17
 ZONE_LETTER = "T"
 GNSS_ORIGIN = [42.3005934157, -83.699283188811]
+_SPAWN_DIAGNOSTIC_LOGGED = set()
+_SPAWN_ACTOR_PROFILE_HOOK = None
+
+
+def get_spawn_actor_profile_hook():
+    return _SPAWN_ACTOR_PROFILE_HOOK
+
+
+def set_spawn_actor_profile_hook(hook):
+    global _SPAWN_ACTOR_PROFILE_HOOK
+    _SPAWN_ACTOR_PROFILE_HOOK = hook
+
 
 TLS_NODES = {
     "NODE_11": [(83,), (92,), None, (88,), (89,), (86,), None, (84,)],
@@ -136,12 +149,125 @@ def isPedestrian(actorID):
     return "VRU" in actorID
 
 
-def spawn_actor(client, blueprint, transform):
+def _distance_3d(a, b):
+    return math.sqrt(
+        (a.x - b.x) ** 2
+        + (a.y - b.y) ** 2
+        + (a.z - b.z) ** 2
+    )
+
+
+def _label_name(label):
+    return getattr(label, "name", str(label))
+
+
+def _summarize_nearby_actors(world, location, *, horizontal_radius=6.0, vertical_tolerance=4.0, limit=5):
+    nearby = []
+    for actor in world.get_actors():
+        if actor.type_id.startswith("sensor."):
+            continue
+        actor_location = actor.get_location()
+        dx = actor_location.x - location.x
+        dy = actor_location.y - location.y
+        dz = actor_location.z - location.z
+        horizontal_distance = math.sqrt(dx**2 + dy**2)
+        if horizontal_distance > horizontal_radius or abs(dz) > vertical_tolerance:
+            continue
+        nearby.append(
+            {
+                "id": actor.id,
+                "type_id": actor.type_id,
+                "role_name": actor.attributes.get("role_name", ""),
+                "horizontal_distance": round(horizontal_distance, 2),
+                "dz": round(dz, 2),
+            }
+        )
+    nearby.sort(key=lambda row: (row["horizontal_distance"], abs(row["dz"])))
+    return nearby[:limit]
+
+
+def _summarize_raycast_hits(world, start_location, end_location, *, limit=6):
+    summaries = []
+    try:
+        hits = world.cast_ray(start_location, end_location)
+    except Exception:
+        return summaries
+
+    for hit in hits[:limit]:
+        summaries.append(
+            {
+                "label": _label_name(hit.label),
+                "distance": round(_distance_3d(start_location, hit.location), 2),
+                "z": round(hit.location.z, 2),
+            }
+        )
+    return summaries
+
+
+def _infer_spawn_collision_hint(nearby_actors, down_hits, up_hits):
+    if nearby_actors:
+        return "nearby_actor_likely"
+
+    non_road_labels = {
+        row["label"]
+        for row in down_hits + up_hits
+        if row["label"] not in {"Roads", "RoadLines", "Ground", "Terrain", "NONE"}
+    }
+    if non_road_labels:
+        return "static_geometry_possible"
+
+    return "unknown"
+
+
+def _log_spawn_collision_diagnostics(world, blueprint, transform, actor_role):
+    location = transform.location
+    nearby_actors = _summarize_nearby_actors(world, location)
+    down_hits = _summarize_raycast_hits(
+        world,
+        carla.Location(location.x, location.y, location.z + 1.0),
+        carla.Location(location.x, location.y, location.z - 8.0),
+    )
+    up_hits = _summarize_raycast_hits(
+        world,
+        carla.Location(location.x, location.y, location.z),
+        carla.Location(location.x, location.y, location.z + 8.0),
+    )
+    cause_hint = _infer_spawn_collision_hint(nearby_actors, down_hits, up_hits)
+    logging.error(
+        "Spawn collision diagnostics. actor=%s blueprint=%s hint=%s location=(%.2f, %.2f, %.2f) nearby_actors=%s down_hits=%s up_hits=%s",
+        actor_role or "<unknown>",
+        blueprint.id,
+        cause_hint,
+        location.x,
+        location.y,
+        location.z,
+        nearby_actors,
+        down_hits,
+        up_hits,
+    )
+
+
+def log_spawn_actor_failure(world, blueprint, transform, actor_role, error):
+    logging.error("Spawn carla actor failed. %s", error)
+    diagnostic_key = actor_role or (
+        blueprint.id,
+        round(transform.location.x, 1),
+        round(transform.location.y, 1),
+        round(transform.location.z, 1),
+    )
+    if world is not None and diagnostic_key not in _SPAWN_DIAGNOSTIC_LOGGED:
+        _SPAWN_DIAGNOSTIC_LOGGED.add(diagnostic_key)
+        _log_spawn_collision_diagnostics(world, blueprint, transform, actor_role)
+
+
+def spawn_actor(client, blueprint, transform, *, world=None, actor_role=None):
     """
     Spawns a new actor.
 
         :param blueprint: blueprint of the actor to be spawned.
         :param transform: transform where the actor will be spawned.
+        :param world: optional CARLA world used for one-shot spawn failure diagnostics.
+        :param actor_role: optional SUMO/CARLA role name for diagnostic logging.
         :return: actor id if the actor is successfully spawned. Otherwise, INVALID_carla_id.
     """
 
@@ -150,9 +276,19 @@ def spawn_actor(client, blueprint, transform):
             carla.command.SetSimulatePhysics(carla.command.FutureActor, False)
         )
     ]
-    response = client.apply_batch_sync(batch, True)[0]
+    profile_hook = _SPAWN_ACTOR_PROFILE_HOOK
+    if profile_hook is None:
+        response = client.apply_batch_sync(batch, True)[0]
+    else:
+        apply_start = time.perf_counter()
+        response = client.apply_batch_sync(batch, True)[0]
+        apply_elapsed = time.perf_counter() - apply_start
+        try:
+            profile_hook(apply_elapsed, not response.error, response.error)
+        except Exception:
+            logging.exception("Spawn actor profile hook failed.")
     if response.error:
-        logging.error("Spawn carla actor failed. %s", response.error)
+        log_spawn_actor_failure(world, blueprint, transform, actor_role, response.error)
         return -1
 
     return response.actor_id
@@ -282,6 +418,16 @@ def carla_to_utm(x, y):
 
     return utm_x, utm_y
 
+
+def sumo_point_to_carla(sumo_location, offset):
+    """Convert a SUMO point without applying vehicle shape correction."""
+    return carla.Location(
+        x=sumo_location[0] + offset[0],
+        y=-sumo_location[1] + offset[1],
+        z=sumo_location[2] + offset[2],
+    )
+
+
 def sumo_to_carla(sumo_location, sumo_rotation, shape, offset):
     # SUMO location is [x,y,z], repsernting the head center of the agent
     # SUMO rotation is [slope, angle, 0.0]
@@ -311,7 +457,7 @@ def carla_to_sumo(carla_location, carla_rotation, shape, offset):
     sumo_yaw = -1 * carla_rotation.yaw
     sumo_location = [
         carla_location.x + math.cos(math.radians(sumo_yaw)) * shape[0] / 2.0 - offset[0],
-        -carla_location.y + math.sin(math.radians(sumo_yaw)) * shape[0] / 2.0 - offset[1],
+        -carla_location.y + math.sin(math.radians(sumo_yaw)) * shape[0] / 2.0 + offset[1],
         carla_location.z - offset[2],
     ]
     sumo_rotation = [

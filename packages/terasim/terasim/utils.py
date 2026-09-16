@@ -483,7 +483,8 @@ def highlight_vehicle(vehID, duration=-1, color=(255, 0, 0, 255)):
         duration (int, optional): Duration of the highlight. Defaults to -1.
         color (tuple, optional): Color of the highlight. Defaults to (255, 0, 0, 255).
     """
-    traci.vehicle.highlight(vehID, duration=duration, color=color, alphaMax=0.1)
+    alpha_max = int(color[3]) if len(color) > 3 else 255
+    traci.vehicle.highlight(vehID, duration=duration, color=color, alphaMax=alpha_max)
 
 
 def get_waiting_time(vehID):

@@ -1,254 +1,63 @@
-# TeraSim Service
+# terasim-service
 
-A HTTP service for TeraSim simulation control and monitoring, built with FastAPI.
+The co-simulation link between TeraSim and CARLA.
 
-## Overview
+TeraSim's SUMO background traffic is mirrored into a running CARLA server, and
+an externally driven ego vehicle — Autoware through `autoware_carla_interface`,
+for example — is fed back into SUMO as the "AV", so the background traffic
+reacts to it.
 
-TeraSim Service provides a comprehensive HTTP API for managing simulation instances, enabling remote control and real-time monitoring capabilities. It offers the following core functionalities:
-- Start new simulation instances
-- Check simulation status
-- Control simulations (pause, resume, stop)
-- Manually advance simulation steps (tick)
-- Retrieve simulation states
-- Send commands to agents
+The TeraSim simulation loop and the CARLA client run as two threads of a single
+process and exchange states and commands as plain Python objects, so a run is a
+single command against a CARLA server.
 
-## Requirements
+## Layout
 
-- Python 3.9+
-- TeraSim and its dependencies
+| module | what it does |
+|---|---|
+| `run_cosim.py` | entry point: starts the TeraSim thread and the CARLA loop |
+| `plugins/cosim_inprocess.py` | the rendezvous between those two threads |
+| `utils/carla/cosim.py` | the CARLA side: traffic mirroring, ego feedback, tick modes, physical control |
+| `utils/carla/ackermann_control.py` | the control law for physics-driven vehicles |
+| `utils/sumo_lane_geometry.py` | maps measured CARLA poses back onto SUMO lanes |
+| `utils/messages/` | the state and command structures that cross the link |
 
-## Setup
-
-1. Install Redis:
-   For details, check [this link](https://redis.io/docs/latest/operate/oss_and_stack/install/install-redis/install-redis-on-linux/)
-
-2. Start Redis server:
-   ```bash
-   sudo systemctl enable redis-server
-   sudo systemctl start redis-server
-   # Verify Redis is running
-   redis-cli ping
-   # Should return "PONG"
-   ```
-
-3. Install TeraSim-Service package:
-   ```bash
-   poetry install
-   ```
-
-## Usage
-
-There are several ways to start the TeraSim Service:
-
-### Method 1: Using the command-line tool
-
-After installation, you can use the provided command-line tool:
+## Running
 
 ```bash
-terasim-service
+python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01_dt005.yaml
 ```
 
-### Method 2: Using the Python module
+A CARLA server must already be running with the matching map. Everything
+map-specific lives in the scenario YAML; `--help` lists the remaining options.
 
-You can run the service as a Python module:
+### Tick modes (`--tick_mode`)
+
+| mode | who owns the clock |
+|---|---|
+| `follow` (default) | the ego-side bridge ticks CARLA; this process follows it |
+| `master` | this process ticks CARLA on a fixed cadence, and the bridge must run with `tick_follower:=true` |
+| `async` | nobody ticks: CARLA free-runs and SUMO is paced against the wall clock |
+
+### Physics-based background vehicles (optional)
+
+By default background vehicles are teleported to the positions SUMO computes.
+They can instead be driven by Ackermann control in CARLA, with their measured
+pose written back into SUMO:
 
 ```bash
-python -m terasim_service
+export CARLA_COSIM_VEHICLE_CONTROL_MODE=ackermann_physics
+export CARLA_COSIM_ACKERMANN_FEEDBACK_MODE=apply
+export CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS='*'          # or a comma-separated list
+export CARLA_COSIM_ACKERMANN_FEEDBACK_ASSIMILATION_MODE=external_state
 ```
 
-### Method 3: Running the example
-
-You can also run the example file to start the service:
-
-```bash
-python examples/main.py
-```
-
-All of these methods will start the service on `http://localhost:8000` by default.
-
-### Example REST API
-The following is an overview of the REST API requests used to interact with the TeraSim simulation service.
-
-1. **Start a Simulation**
-   
-   **Endpoint**: `POST /start_simulation`
-   
-   **Description**: Starts a new simulation with the specified configuration file.
-
-   **Request**:
-   ```
-   POST http://localhost:8000/start_simulation
-   Content-Type: application/json
-
-   {
-      "config_file": "examples/simulation_config.yaml", 
-      "auto_run": false
-   }
-   ```
-   Response:
-   - **200 OK**: Returns the `simulation_id` for the newly started simulation.
-   - Example:
-   ```
-   {
-      "simulation_id": "0fd93635-b2ea-4b17-818a-55cad6bb6691",
-      "message": "Simulation started"
-   }
-   ```
-
-2. **Store Simulation ID**
-   
-   The `simulation_id` returned from the `start_simulation` request is stored in a variable for use in subsequent requests.
-
-3. **Check Simulation Status**
-   
-   **Endpoint**: `GET /simulation_status/{simulationId}`
-   
-   **Description**: Retrieves the current status of the simulation.
-
-   **Request**:
-   ```
-   GET http://localhost:8000/simulation_status/{{simulationId}}
-   ```
-
-   **Response**:
-   - **200 OK**: Returns the current status of the simulation.
-   - **Example**:
-   ```
-   {
-      "id": "0fd93635-b2ea-4b17-818a-55cad6bb6691",
-      "status": "running",
-      "progress": 0.0
-   }
-   ```
-   The simulation will have the following statuses and their meanings are shown below:
-      | Simulation Status | Meaning                                                                 |
-      |-------------------|-------------------------------------------------------------------------|
-      | "initializing"         | The simulation has started for traffic flow initialization.             |
-      | "wait_for_tick"     | The traffic flow has been initialized and the simulation is waiting for the "tick" command. |
-      | "running"         | After receiving the "tick" command, the TeraSim simulation has started to advance for one step and it will take hundreds of milliseconds to finish the calculation. |
-      | "ticked"         | The TeraSim simulation has finished the one-step advance and it is waiting for the next "tick" command. |
-      | "finished"        | The TeraSim simulation has come to an end.                              |
-
-4. **Stop Simulation**
-
-   **Endpoint**: `POST /simulation_control/{simulationId}`
-
-   **Description**: Stops the simulation.
-
-   **Request**:
-   ```
-   POST http://localhost:8000/simulation_control/{{simulationId}}
-   Content-Type: application/json
-
-   {
-      "command": "stop"
-   }
-   ```
-
-5. **Tick the Simulation**
-   
-   **Endpoint**: `POST /simulation_tick/{simulationId}`
-   
-   **Description**: Advances the simulation by one step (only works when auto_run is false).
-
-   **Request**:
-   ```
-   POST http://localhost:8000/simulation_tick/{{simulationId}}
-   ```
-
-6. **Get Simulation States**
-   
-   **Endpoint**: `GET /simulation/{simulationId}/state`
-   
-   **Description**: Retrieves states of all interested agents inside the simulation.
-
-   **Request**:
-   ```
-   GET http://localhost:8000/simulation/{{simulationId}}/state
-   ```
-
-   **Response**:
-   - **200 OK**: Returns the current states of the simulation.
-   - **Example**: 
-   ```
-   {
-      "header": {"timestamp": [...], "information": [...]},
-      "simulation_time": [...],
-      "agent_count": {"vehicle": [...], "vru": [...]},
-      "agent_details": {
-         "vehicle": {
-            "BV_bike_flow_5.23": {
-               "x": 58.01538972502436,
-               "y": 60.92,
-               "z": 0.0,
-               "lat": 0.0,
-               "lon": 0.0,
-               "sumo_angle": 90.0, 
-               "length": 1.6,
-               "width": 0.65,
-               "height": 1.7,
-               "speed": 5.591859473845301,
-               "type": "DEFAULT_BIKETYPE"
-            },
-            ...
-         }
-         "vru": [...],
-      },
-      "traffic_light_details": [...],
-   }
-   ```
-
-   **Note**:
-   - The `x`, `y`, and `z` coordinates of the agent are in the SUMO map coordinate system and represent the position of the agent's front bumper center.
-   - The `sumo_angle` of the agent is measured in degrees, ranging from 0 to 360. A value of 0 represents north, and the sumo_angle increases clockwise.
-
-7. **Control a Specific agent**
-
-   **Endpoint**: `POST /simulation/{simulationId}/agent_command`
-   
-   **Description**: Sends a control command to a specific agent in the simulation.
-
-   **Request**:
-   ```
-   POST http://localhost:8000/simulation/{{simulationId}}/agent_command
-   Content-Type: application/json
-
-   {
-      "agent_id": "AV",
-      "agent_type": "vehicle",
-      "command_type": "set_state",
-      "data": {
-         "position": [112, 45.85],
-         "lonlat": [-96.21622, 29.759548],
-         
-         "speed": 0.0
-      }
-   }
-   ```
-   **Note**: 
-   - Either use `position` or `lonlat` in the data field, but not both at the same time
-   - `position` represents coordinates in the SUMO map coordinate system
-   - `lonlat` represents GPS coordinates in decimal degrees format (longitude, latitude)
-   - For vehicles, `position` or `lonlat` denotes the front bumper center of the vehicle
-   - `speed` is measured in meters per second (m/s)
-
-   **Response**:
-   - **200 OK**: Confirms that the command was successfully sent.
-   - **Example**:
-   ```
-   {
-      "message": "Agent command sent for agent AV"
-   }
-   ```
+All four are required: the feedback path stays off if the actor list is empty.
+`external_state` additionally needs a SUMO build carrying the patch in
+[`apps/sumo_external_state/`](../../apps/sumo_external_state/). The remaining
+knobs are documented in
+[`docs/carla_ackermann_feedback.md`](../../docs/carla_ackermann_feedback.md).
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Support
-
-For support, please open an issue in the GitHub repository.
+Apache License 2.0 — see [LICENSE](LICENSE).

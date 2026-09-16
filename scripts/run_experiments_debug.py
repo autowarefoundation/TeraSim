@@ -1,10 +1,8 @@
 import argparse
-import random
 import hydra
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
-from tqdm import tqdm
 from terasim.logger.infoextractor import InfoExtractor
 from terasim.simulator import Simulator
 
@@ -40,7 +38,7 @@ def main(config_path: str) -> None:
         log_dir=base_dir,
         warmup_time_lb=config.environment.parameters.warmup_time_lb,
         warmup_time_ub=config.environment.parameters.warmup_time_ub,
-        run_time=1200,
+        run_time=config.environment.parameters.run_time,
         configuration=config.environment.parameters,
         # av_debug_control=True, # Enable debug control for AV, will use SUMO
     )
@@ -48,23 +46,16 @@ def main(config_path: str) -> None:
     # Paths already resolved in config
     sumo_net_file = config.input.sumo_net_file
     sumo_config_file = config.input.sumo_config_file
-    # sumo_additional_file = config.input.sumo_additional_file
-    # sumo_additional_file = "./vTypeDistributions.add.xml"
 
     sim = Simulator(
         sumo_net_file_path=sumo_net_file,
         sumo_config_file_path=sumo_config_file,
-        # sumo_additional_file_path=sumo_additional_file,
         num_tries=10,
         gui_flag=config.simulator.parameters.gui_flag,
         realtime_flag=config.simulator.parameters.realtime_flag,
         output_path=base_dir,
-        sumo_output_file_types=["collision"],
-        traffic_scale=(
-            config.simulator.parameters.traffic_scale
-            if hasattr(config.simulator.parameters, "traffic_scale")
-            else 1
-        ),
+        sumo_output_file_types=config.simulator.parameters.sumo_output_file_types,
+        traffic_scale=config.simulator.parameters.traffic_scale if hasattr(config.simulator.parameters, "traffic_scale") else 1,
         additional_sumo_args=[
             "--device.bluelight.explicit",
             "true",
@@ -83,8 +74,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default="examples/scenarios/Mcity_safety_assessment.yaml",
-        help="Path to YAML configuration file (default: configs/simulation/test.yaml)"
+        required=True,
+        help="Path to the scenario YAML configuration file"
     )
 
     args = parser.parse_args()
