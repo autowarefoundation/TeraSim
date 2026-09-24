@@ -50,6 +50,23 @@ class FakeWorld:
         return self.actors.get(actor_id)
 
 
+class FreezableLight(FakeLight):
+    frozen = False
+
+    def freeze(self, value):
+        self.frozen = value
+
+
+class SynchronousWorld(FakeWorld):
+    """Lists no actors until it has ticked, as a synchronous world does for a new client."""
+
+    ticked = False
+
+    def get_actors(self):
+        lights = list(self.actors.values()) if self.ticked else []
+        return SimpleNamespace(filter=lambda pattern: lights)
+
+
 @pytest.fixture(autouse=True)
 def fake_carla(monkeypatch):
     monkeypatch.setattr(
@@ -231,3 +248,32 @@ def test_offset_token_also_resolves_unprefixed_actor_opendrive_id():
     actor = FakeLight(1, "466")
     sync = tls.TrafficLightSynchronizer(FakeWorld([actor]), [actor])
     assert sync.resolve("od:2000466") is actor
+
+
+def test_traffic_lights_missing_at_startup_are_picked_up_after_the_world_ticks(monkeypatch, capsys):
+    from terasim_service.utils.carla import cosim as cosim_module
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    monkeypatch.setattr(cosim_module, "carla", tls.carla)
+
+    actor = FreezableLight(1, "10")
+    world = SynchronousWorld([actor])
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.world = world
+    cosim.args = SimpleNamespace(skip_tls=False)
+    cosim._initialize_traffic_lights()
+    assert "No CARLA traffic lights visible yet" in capsys.readouterr().out
+    snapshot = {"traffic_light_details": {"n": detail("g", {"linkSignalID:0": "od:10"})}}
+
+    cosim.sync_cosim_tls_to_carla(snapshot)
+    assert actor.states == []
+
+    world.ticked = True
+    cosim.sync_cosim_tls_to_carla(snapshot)
+    assert actor.frozen
+    assert actor.states == ["off", "green"]
+
+    snapshot["traffic_light_details"]["n"]["tls"] = "r"
+    cosim.sync_cosim_tls_to_carla(snapshot)
+    assert actor.states == ["off", "green", "red"]
+    assert capsys.readouterr().out.count("after startup") == 1
