@@ -1,4 +1,4 @@
-"""SUMO traffic-light reflection, ported from TeraSim d918bdc.
+"""SUMO-to-CARLA traffic-light synchronization.
 
 Static OpenDRIVE lookup is built once; legacy actor-ID parameters stay supported.
 The caller owns CARLA ticking and the existing initial Off/freeze operation.
