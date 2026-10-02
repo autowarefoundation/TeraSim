@@ -162,7 +162,7 @@ index a733726bc..a67221f43 100644
 +                                  const double x, const double y, double angle = libsumo::INVALID_DOUBLE_VALUE,
 +                                 const int keepRoute = 1, double matchThreshold = 100, bool strictLaneHint = false);
 diff --git a/src/microsim/MSLaneChangerSublane.cpp b/src/microsim/MSLaneChangerSublane.cpp
-index 48248b2a6..f1f5fb7fb 100644
+index 48248b2a6..3041df5b7 100644
 --- a/src/microsim/MSLaneChangerSublane.cpp
 +++ b/src/microsim/MSLaneChangerSublane.cpp
 @@ -117,0 +118,18 @@ MSLaneChangerSublane::change() {
@@ -222,6 +222,57 @@ index 48248b2a6..f1f5fb7fb 100644
 +            return true;
 +        }
 +    }
+@@ -528,0 +584,30 @@ MSLaneChangerSublane::checkChangeToNewLane(MSVehicle* vehicle, const int directi
++        bool rebaseExternalGeometry = false;
++        double targetPosLat = 0.;
++        const bool traciManeuver =
++            (vehicle->getLaneChangeModel().getOwnState() & LCA_TRACI) != 0;
++        if (!opposite && vehicle->hasInfluencer()
++                && vehicle->getInfluencer().hasImmediateExternalState(from->lane, SIMSTEP)) {
++            // Both Phase-A envelope rebases and ordinary Phase-B switches run
++            // after longitudinal movement. Preserve current world progress
++            // across custom lane shapes with different longitudinal origins.
++            const Position worldPosition = vehicle->getPosition();
++            const Position targetCoordinates =
++                to->lane->getShape().transformToVectorCoordinates(worldPosition);
++            const double targetGeometryPos =
++                to->lane->getShape().nearest_offset_to_point25D(worldPosition, false);
++            const double targetPos =
++                to->lane->interpolateGeometryPosToLanePos(targetGeometryPos);
++            if (targetGeometryPos != GeomHelper::INVALID_OFFSET
++                    && targetCoordinates != Position::INVALID
++                    && std::isfinite(targetCoordinates.y())
++                    && std::isfinite(targetPos)
++                    && targetPos >= 0. && targetPos <= to->lane->getLength()) {
++                rebaseExternalGeometry = true;
++                targetPosLat = targetCoordinates.y()
++                               / vehicle->getInfluencer().getRemotePositionGeometrySign();
++                // A coordinate change is not distance travelled. Set it
++                // before enterLaneAtLaneChange rebuilds rear occupancy.
++                vehicle->addToOdometer(vehicle->myState.myPos - targetPos);
++                vehicle->myState.myPos = targetPos;
++            }
++        }
+@@ -545,0 +631,19 @@ MSLaneChangerSublane::checkChangeToNewLane(MSVehicle* vehicle, const int directi
++        if (rebaseExternalGeometry) {
++            // Nominal lane widths may differ from custom-shape separation.
++            // Keep the already-generated Phase-B world pose and continue the
++            // maneuver toward the real target centre, without a lateral jump.
++            MSAbstractLaneChangeModel& laneChangeModel = vehicle->getLaneChangeModel();
++            const double correction = targetPosLat - vehicle->getLateralPositionOnLane();
++            vehicle->setLateralPositionOnLane(targetPosLat);
++            vehicle->invalidateCachedPosition();
++            for (double& furtherPosLat : vehicle->myFurtherLanesPosLat) {
++                furtherPosLat += correction;
++            }
++            laneChangeModel.updateSafeLatDist(correction);
++            laneChangeModel.setManeuverDist(-targetPosLat);
++            if (traciManeuver) {
++                vehicle->getInfluencer().setSublaneChange(-targetPosLat);
++            }
++            laneChangeModel.updateShadowLane();
++            laneChangeModel.updateTargetLane();
++        }
 diff --git a/src/microsim/MSVehicle.cpp b/src/microsim/MSVehicle.cpp
 index 1792121ea..9e7482753 100644
 --- a/src/microsim/MSVehicle.cpp
@@ -582,7 +633,7 @@ index 1792121ea..9e7482753 100644
 -                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, -myFurtherLanesPosLat.back() * (MSGlobals::gLefthand ? -1 : 1));
 +                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, geometrySign * myFurtherLanesPosLat.back());
 diff --git a/src/microsim/MSVehicle.h b/src/microsim/MSVehicle.h
-index 05b62c06a..988fd5c3e 100644
+index 05b62c06a..08a39401b 100644
 --- a/src/microsim/MSVehicle.h
 +++ b/src/microsim/MSVehicle.h
 @@ -566,0 +567,3 @@ public:
@@ -592,7 +643,7 @@ index 05b62c06a..988fd5c3e 100644
 @@ -1561 +1564 @@ public:
 -        void setRemoteControlled(Position xyPos, MSLane* l, double pos, double posLat, double angle, int edgeOffset, const ConstMSEdgeVector& route, SUMOTime t);
 +        void setRemoteControlled(Position xyPos, MSLane* l, double pos, double posLat, double angle, int edgeOffset, const ConstMSEdgeVector& route, SUMOTime t, bool strictLaneHint = false);
-@@ -1571 +1574,8 @@ public:
+@@ -1571 +1574,21 @@ public:
 -        void postProcessRemoteControl(MSVehicle* v);
 +        void postProcessRemoteControl(MSVehicle* v, bool immediate = false);
 +
@@ -602,7 +653,11 @@ index 05b62c06a..988fd5c3e 100644
 +        double getRemotePositionGeometrySign() const {
 +            return myRemotePositionGeometrySign;
 +        }
-@@ -1572,0 +1583,23 @@ public:
++
++
++        bool hasImmediateExternalState(const MSLane* lane, SUMOTime t) const {
++            return myExternalStateLane == lane && myExternalStateTime == t;
++        }
 +
 +        int consumeRemoteLaneChangeRebase(double& targetPosLat) {
 +            const int direction = myRemoteLaneChangeRebaseDirection;
@@ -611,7 +666,7 @@ index 05b62c06a..988fd5c3e 100644
 +            myRemoteLaneChangeRebaseTargetPosLat = 0.;
 +            return direction;
 +        }
-+
+@@ -1572,0 +1596,14 @@ public:
 +        bool consumeRemoteLaneChangeSpeedRestore(double& speedLat) {
 +            const bool pending = myRemoteLaneChangeSpeedRestorePending;
 +            speedLat = myRemoteLaneChangeSpeedRestore;
@@ -626,7 +681,7 @@ index 05b62c06a..988fd5c3e 100644
 +            myRemoteLaneChangeSpeedRestorePending = false;
 +            myRemoteLaneChangeSpeedRestore = 0.;
 +        }
-@@ -1656,0 +1690,14 @@ public:
+@@ -1656,0 +1694,14 @@ public:
 +        double myRemotePositionGeometrySign;
 +        bool myRemoteStrictLaneHint;
 +        bool myRemotePrePhaseAOnRoad;

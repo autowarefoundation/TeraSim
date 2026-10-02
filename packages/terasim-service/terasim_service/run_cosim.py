@@ -49,6 +49,7 @@ from .utils.base import (
     create_simulator,
     load_config,
     resolve_config_paths,
+    resolve_environment_av_control_mode,
     set_random_seed,
 )
 
@@ -62,13 +63,102 @@ def _run_simulation(sim, plugin):
         plugin.abort("error")
 
 
+def resolve_av_control_settings(cli_mode, legacy_control_av, scenario_parameters):
+    """Resolve AV authority and the legacy CARLA-feedback boolean."""
+    scenario_explicit = (
+        "av_control_mode" in scenario_parameters or "av_debug_control" in scenario_parameters
+    )
+    scenario_mode = resolve_environment_av_control_mode(scenario_parameters)
+    if cli_mode is not None:
+        cli_mode = str(cli_mode).strip().lower()
+        if scenario_explicit and cli_mode != scenario_mode:
+            raise ValueError(
+                f"--av-control-mode={cli_mode} conflicts with scenario mode {scenario_mode}"
+            )
+        mode = cli_mode
+    else:
+        mode = scenario_mode
+
+    implied_control_av = mode == "external"
+    explicit_mode = cli_mode is not None or scenario_explicit
+    if legacy_control_av is not None and explicit_mode:
+        if bool(legacy_control_av) != implied_control_av:
+            raise ValueError(
+                "--control-av/--no-control-av conflicts with --av-control-mode "
+                f"or environment.parameters.av_control_mode={mode}"
+            )
+    elif legacy_control_av is not None:
+        # Preserve the old two-party --no-control-av launch when no new mode
+        # was selected. The TeraSim AV remains externally managed as before.
+        return "external", bool(legacy_control_av)
+    return mode, implied_control_av
+
+
+def validate_sumo_av_physics_configuration(args):
+    """Reject partial SUMO-AV physics configurations instead of falling back."""
+    if args.tick_mode != "master":
+        raise ValueError("--av-control-mode=sumo requires --tick_mode=master")
+    vehicle_control_mode = (
+        os.getenv("CARLA_COSIM_VEHICLE_CONTROL_MODE", "transform").strip().lower()
+    )
+    feedback_mode = os.getenv("CARLA_COSIM_ACKERMANN_FEEDBACK_MODE", "off").strip().lower()
+    assimilation_mode = (
+        os.getenv("CARLA_COSIM_ACKERMANN_FEEDBACK_ASSIMILATION_MODE", "legacy").strip().lower()
+    )
+    feedback_actors = {
+        value.strip()
+        for value in os.getenv("CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS", "").split(",")
+        if value.strip()
+    }
+    enabled_values = {"1", "true", "yes", "on"}
+    maneuver_enabled = (
+        os.getenv("CARLA_COSIM_ACKERMANN_LATERAL_MANEUVER_ENABLED", "0").strip().lower()
+        in enabled_values
+    )
+    target_enabled = (
+        os.getenv("CARLA_COSIM_ACKERMANN_LATERAL_MANEUVER_TARGET_ENABLED", "0").strip().lower()
+        in enabled_values
+    )
+    errors = []
+    if vehicle_control_mode != "ackermann_physics":
+        errors.append("vehicle control mode must be ackermann_physics")
+    if feedback_mode != "apply":
+        errors.append("feedback mode must be apply")
+    if assimilation_mode != "external_state":
+        errors.append("feedback assimilation mode must be external_state")
+    if not ({"AV", "*"} & feedback_actors):
+        errors.append("feedback actors must include AV or *")
+    if not maneuver_enabled or not target_enabled:
+        errors.append("lateral maneuver master and target flags must both be enabled")
+    if errors:
+        raise ValueError("invalid SUMO-controlled AV physics configuration: " + "; ".join(errors))
+
+
+def apply_av_control_settings(args, config, parser):
+    try:
+        args.av_control_mode, args.control_av = resolve_av_control_settings(
+            args.av_control_mode,
+            args.control_av,
+            config["environment"]["parameters"],
+        )
+        if args.av_control_mode == "sumo":
+            validate_sumo_av_physics_configuration(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    config["environment"]["parameters"]["av_control_mode"] = args.av_control_mode
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Run TeraSim + CARLA co-sim client in one process (no Redis/gRPC)"
     )
     p.add_argument("--config", required=True, help="TeraSim scenario yaml path")
-    p.add_argument("--ready_timeout", default=600.0, type=float,
-                   help="max seconds to wait for the SUMO network to load")
+    p.add_argument(
+        "--ready_timeout",
+        default=600.0,
+        type=float,
+        help="max seconds to wait for the SUMO network to load",
+    )
     # CARLA client options (same set the removed two-process client scripts took)
     p.add_argument("--carla_host", default="127.0.0.1")
     p.add_argument("--carla_port", default=2000, type=int,
@@ -96,6 +186,25 @@ def main():
                    help="CARLA role_names never destroyed by cleanup (the bridge spawns the ego as ego_vehicle)")
     p.add_argument("--av_carla_role", default="ego_vehicle",
                    help="CARLA role_name whose pose is fed back to the SUMO AV")
+    p.add_argument(
+        "--av-control-mode",
+        choices=["external", "sumo"],
+        default=None,
+        help=(
+            "AV authority: external (default) keeps the existing external controller; "
+            "sumo delegates car-following and ordinary lane changes to SUMO"
+        ),
+    )
+    p.add_argument(
+        "--control-av",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "legacy compatibility flag; feed an externally owned CARLA ego pose "
+            "back to SUMO AV; use "
+            "--no-control-av for two-party TeraSim-CARLA physical co-simulation"
+        ),
+    )
     args = p.parse_args()
 
     # Two threads share one interpreter: while this thread runs Python (CARLA
@@ -118,12 +227,12 @@ def main():
     args.tick_master = args.tick_mode == "master"
     args.tick_async = args.tick_mode == "async"
     args.skip_tls = not args.sync_tls
-    args.control_av = True     # feed the Autoware ego pose back to the SUMO AV
     args.terasim_config = args.config  # CarlaCosim reads the SUMO net path from the scenario yaml
 
     # --- build the TeraSim simulation exactly like run_experiments/api ---
     config = load_config(args.config)
     config = resolve_config_paths(config, args.config)
+    apply_av_control_settings(args, config, p)
     simulation_id = str(uuid.uuid4())
 
     base_dir = (
@@ -148,6 +257,8 @@ def main():
         plugin_config=plugin_config,
         base_dir=str(base_dir),
         auto_run=False,
+        control_av=args.control_av,
+        av_control_mode=args.av_control_mode,
     )
     plugin.inject(sim, {})
 
@@ -160,7 +271,8 @@ def main():
 
     logger.info(
         f"[run_cosim] simulation_id={simulation_id} output={base_dir} "
-        f"carla={args.carla_host}:{args.carla_port}"
+        f"carla={args.carla_host}:{args.carla_port} "
+        f"av_control_mode={args.av_control_mode} control_av={args.control_av}"
     )
 
     sim_thread = threading.Thread(
@@ -199,7 +311,8 @@ def main():
             logger.warning(
                 "[run_cosim] world settings differ (sync={}, fixed_delta={}); "
                 "applying sync=True fixed_delta={} as the clock master",
-                settings.synchronous_mode, settings.fixed_delta_seconds,
+                settings.synchronous_mode,
+                settings.fixed_delta_seconds,
                 args.step_length,
             )
         settings.synchronous_mode = True
@@ -221,7 +334,8 @@ def main():
             logger.warning(
                 "[run_cosim] clearing sync world settings (sync={}, "
                 "fixed_delta={}) for tick_mode=async",
-                settings.synchronous_mode, settings.fixed_delta_seconds,
+                settings.synchronous_mode,
+                settings.fixed_delta_seconds,
             )
         settings.synchronous_mode = False
         settings.fixed_delta_seconds = None

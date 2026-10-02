@@ -5,8 +5,10 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class AckermannTuning:
     wheel_base: float = 2.8
+    lateral_gain: float = 1.0
     max_steer_rad: float = 0.6
     max_steer_rate_rad_s: float = 0.6
+    lateral_low_speed_blend_end: float = 0.5
     position_speed_gain: float = 1.0
     kp_speed: float = 0.8
     kp_position: float = 0.15
@@ -60,6 +62,15 @@ class AckermannControlValues:
     control_point_x: float
     control_point_y: float
     wheel_base: float
+    lateral_control_mode: str = "pure_pursuit"
+    path_curvature: float | None = None
+    path_heading_error: float | None = None
+    path_cross_track_error: float | None = None
+    path_feedforward_steer: float | None = None
+    path_heading_feedback_steer: float | None = None
+    path_cross_track_feedback_steer: float | None = None
+    path_cross_track_feedback_unblended_steer: float | None = None
+    path_cross_track_low_speed_blend: float | None = None
 
 
 def clamp(value, lower, upper):
@@ -98,6 +109,10 @@ def rate_limit(value, previous_value, max_rate, dt):
     return clamp(value, previous_value - max_delta, previous_value + max_delta)
 
 
+def wrap_angle_radians(value):
+    return math.atan2(math.sin(float(value)), math.cos(float(value)))
+
+
 def compute_ackermann_control_values(
     *,
     current_x,
@@ -114,6 +129,9 @@ def compute_ackermann_control_values(
     tuning=AckermannTuning(),
     control_point_local_x=0.0,
     wheel_base=None,
+    path_curvature=None,
+    path_heading_degrees=None,
+    path_cross_track_error=None,
 ):
     desired_speed = max(0.0, float(desired_speed))
     current_speed = max(0.0, float(current_speed))
@@ -133,11 +151,49 @@ def compute_ackermann_control_values(
         current_x, current_y, yaw_degrees, desired_x, desired_y
     )
 
-    lookahead_distance = max(math.hypot(lookahead_local_x, lookahead_local_y), 0.1)
-    alpha = math.atan2(lookahead_local_y, lookahead_local_x)
-    curvature = 2.0 * math.sin(alpha) / lookahead_distance
+    path_inputs = (path_curvature, path_heading_degrees, path_cross_track_error)
+    use_path_tracker = any(value is not None for value in path_inputs)
+    path_heading_error = None
+    path_feedforward_steer = None
+    path_heading_feedback_steer = None
+    path_cross_track_feedback_steer = None
+    path_cross_track_feedback_unblended_steer = None
+    path_cross_track_low_speed_blend = None
+    if use_path_tracker:
+        if any(value is None for value in path_inputs):
+            raise ValueError("canonical path tracker inputs must be supplied together")
+        try:
+            path_curvature = float(path_curvature)
+            path_heading_degrees = float(path_heading_degrees)
+            path_cross_track_error = float(path_cross_track_error)
+        except (TypeError, ValueError):
+            raise ValueError("invalid canonical path tracker input") from None
+        path_inputs = (path_curvature, path_heading_degrees, path_cross_track_error)
+        if not all(math.isfinite(value) for value in path_inputs):
+            raise ValueError("non-finite canonical path tracker input")
 
-    raw_steer = math.atan(effective_wheel_base * curvature)
+        path_heading_error = wrap_angle_radians(math.radians(path_heading_degrees) - yaw_radians)
+        path_feedforward_steer = math.atan(effective_wheel_base * path_curvature)
+        path_heading_feedback_steer = path_heading_error
+        path_cross_track_feedback_unblended_steer = -math.atan2(
+            tuning.lateral_gain * path_cross_track_error,
+            max(current_speed, 0.2),
+        )
+        blend_end = max(1e-6, float(tuning.lateral_low_speed_blend_end))
+        path_cross_track_low_speed_blend = clamp(current_speed / blend_end, 0.0, 1.0)
+        path_cross_track_feedback_steer = (
+            path_cross_track_feedback_unblended_steer * path_cross_track_low_speed_blend
+        )
+        raw_steer = (
+            path_feedforward_steer + path_heading_feedback_steer + path_cross_track_feedback_steer
+        )
+        lateral_control_mode = "canonical_front_path"
+    else:
+        lookahead_distance = max(math.hypot(lookahead_local_x, lookahead_local_y), 0.1)
+        alpha = math.atan2(lookahead_local_y, lookahead_local_x)
+        curvature = tuning.lateral_gain * 2.0 * math.sin(alpha) / lookahead_distance
+        raw_steer = math.atan(effective_wheel_base * curvature)
+        lateral_control_mode = "pure_pursuit"
     clamped_steer = clamp(raw_steer, -tuning.max_steer_rad, tuning.max_steer_rad)
     steer = rate_limit(clamped_steer, previous_steer, tuning.max_steer_rate_rad_s, dt)
 
@@ -161,4 +217,13 @@ def compute_ackermann_control_values(
         control_point_x=control_point_x,
         control_point_y=control_point_y,
         wheel_base=effective_wheel_base,
+        lateral_control_mode=lateral_control_mode,
+        path_curvature=path_curvature if use_path_tracker else None,
+        path_heading_error=path_heading_error,
+        path_cross_track_error=path_cross_track_error if use_path_tracker else None,
+        path_feedforward_steer=path_feedforward_steer,
+        path_heading_feedback_steer=path_heading_feedback_steer,
+        path_cross_track_feedback_steer=path_cross_track_feedback_steer,
+        path_cross_track_feedback_unblended_steer=path_cross_track_feedback_unblended_steer,
+        path_cross_track_low_speed_blend=path_cross_track_low_speed_blend,
     )
