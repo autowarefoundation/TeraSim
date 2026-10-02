@@ -28,12 +28,15 @@ TICK_MODE="${COSIM_TICK_MODE:-follow}"
 # world.tick() while it warms up its rendering pipeline; raise this (e.g. 3600)
 # if the first tick exceeds the default.
 CARLA_TIMEOUT="${CARLA_TIMEOUT:-600}"
+# Extra run_cosim arguments, space separated (for example --sync_tls).
+EXTRA_ARGS="${TERASIM_EXTRA_ARGS:-}"
 
 echo "=========================================="
 echo " TeraSim 3-cosim (in-process)"
 echo "  CARLA :${CARLA_PORT}"
 echo "  scenario: ${SCENARIO}"
 echo "  tick_mode: ${TICK_MODE}"
+echo "  extra args: ${EXTRA_ARGS:-none}"
 echo "=========================================="
 
 # -- Step 1: remove every non-ego vehicle from CARLA (makes the run idempotent) --
@@ -70,4 +73,5 @@ exec python -m terasim_service.run_cosim \
   --carla_host "${CARLA_HOST}" \
   --carla_port "${CARLA_PORT}" \
   --carla_timeout "${CARLA_TIMEOUT}" \
-  --tick_mode "${TICK_MODE}"
+  --tick_mode "${TICK_MODE}" \
+  ${EXTRA_ARGS}

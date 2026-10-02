@@ -43,6 +43,9 @@ services:
       # Draw an "AV" label above the ego (one RPC per tick). Set to 0 for
       # headless measurement runs.
       - CARLA_COSIM_EGO_LABEL=${CARLA_COSIM_EGO_LABEL:-1}
+      # Extra run_cosim arguments, space separated. For example --sync_tls lets
+      # the SUMO traffic lights drive the CARLA ones.
+      - TERASIM_EXTRA_ARGS=${TERASIM_EXTRA_ARGS:-}
     volumes:
       - ./examples:/app/examples
       # terasim-service is installed editable in the image, so bind-mounting the

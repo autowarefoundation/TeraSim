@@ -35,9 +35,9 @@ from .tools import (
     sumo_point_to_carla,
     sumo_to_carla,
 )
+from .traffic_light_sync import TrafficLightSynchronizer
 
 AV_SUMO_ID = "AV"
-SUMO_CARLA_TLS_LINK_PREFIX = "linkSignalID:"
 VEHICLE_CONTROL_MODE_TELEPORT = "teleport"
 VEHICLE_CONTROL_MODE_ACKERMANN_PHYSICS = "ackermann_physics"
 
@@ -88,10 +88,7 @@ class CarlaCosim(object):
         else:
             print("No map name provided. Loading default map.")
 
-        self.traffic_lights = self.world.get_actors().filter("traffic.traffic_light")
-        for traffic_light in self.traffic_lights:
-            traffic_light.set_state(carla.TrafficLightState.Off)
-            traffic_light.freeze(True)
+        self._initialize_traffic_lights()
 
         self.control_av = args.control_av
         self.initialize_av = False
@@ -3522,60 +3519,38 @@ class CarlaCosim(object):
 
         return av_command
 
+    def _initialize_traffic_lights(self, traffic_lights=None):
+        """Switch the CARLA traffic lights off, freeze them and set up the SUMO signal sync."""
+        if traffic_lights is None:
+            traffic_lights = self.world.get_actors().filter("traffic.traffic_light")
+        self.traffic_lights = traffic_lights
+        for traffic_light in self.traffic_lights:
+            traffic_light.set_state(carla.TrafficLightState.Off)
+            traffic_light.freeze(True)
+
+        self.traffic_light_sync = (
+            None
+            if getattr(self.args, "skip_tls", False)
+            else TrafficLightSynchronizer(self.world, self.traffic_lights)
+        )
+        if self.traffic_light_sync is not None and len(self.traffic_lights) == 0:
+            print("[TLS] No CARLA traffic lights visible yet; retrying on each step.", flush=True)
+
     def sync_cosim_tls_to_carla(self, terasim_states):
-        if not terasim_states:
-            print("terasim_states not available.")
-            return
-
-        if "traffic_light_details" not in terasim_states:
-            print("No traffic light details available.")
-            return
-
-        terasim_tls_data = terasim_states["traffic_light_details"]
-
-        for node_id, node_info in terasim_tls_data.items():
-            sumo_tls = node_info["tls"]
-            sumo_information = json.loads(node_info["information"])
-            parameters = None
-            for program_id, program in sumo_information["programs"].items():
-                try:
-                    parameters = program["parameters"]
-                    break
-                except KeyError:
-                    print(f"KeyError: Node ({node_id}) Program ({program}) does not have 'parameters' key.")
-                    continue
-            if parameters is None:
-                print(f"Traffic Lights within Node ({node_id}) is not synchronized with Carla.")
-                continue
-
-            for i in range(len(sumo_tls)):
-                param_key = f"{SUMO_CARLA_TLS_LINK_PREFIX}{i}"
-                carla_landmark_ids = parameters.get(param_key, "")
-                if carla_landmark_ids == "":
-                    continue
-                carla_landmark_ids = carla_landmark_ids.split(" ")
-                for landmark_id in carla_landmark_ids:
-                    light_id = int(landmark_id)
-                    light_actor = self.world.get_actor(light_id)
-                    if not light_actor:
-                        print(f"Traffic light with ID {light_id} not found in CARLA.")
-                        continue
-
-                    # Defensive guard: CARLA may return a non-TrafficLight Actor
-                    # when SUMO's TLS program parameters are not mapped to a
-                    # real CARLA landmark_id (e.g. netconvert --tls.guess nets
-                    # like Town01). Calling set_state on such an actor raises
-                    # AttributeError and aborts the whole cosim tick.
-                    if not isinstance(light_actor, carla.TrafficLight):
-                        continue
-
-                    light_state = sumo_tls[i]
-                    if light_state == "G" or light_state == "g":
-                        light_actor.set_state(carla.TrafficLightState.Green)
-                    elif light_state == "Y" or light_state == "y":
-                        light_actor.set_state(carla.TrafficLightState.Yellow)
-                    elif light_state == "R" or light_state == "r":
-                        light_actor.set_state(carla.TrafficLightState.Red)
+        traffic_lights = getattr(self, "traffic_lights", None)
+        # A client lists no actors before its first world snapshot, as at startup when the
+        # bridge has loaded the world in synchronous mode and waits for this process to tick.
+        if traffic_lights is not None and len(traffic_lights) == 0:
+            traffic_lights = self.world.get_actors().filter("traffic.traffic_light")
+            if len(traffic_lights) == 0:
+                return
+            self._initialize_traffic_lights(traffic_lights)
+            print(
+                f"[TLS] Found {len(self.traffic_lights)} CARLA traffic lights after startup.",
+                flush=True,
+            )
+        if self.traffic_light_sync is not None and terasim_states:
+            self.traffic_light_sync.sync(terasim_states.get("traffic_light_details", {}))
 
     @staticmethod
     def _actor_xy(actor_info):

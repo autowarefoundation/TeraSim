@@ -77,6 +77,12 @@ SCENARIO=/app/examples/scenarios/cosim_town01_dt005.yaml \
 Physics-based background vehicles additionally need the patched SUMO build from
 `Dockerfile.sumo-external-state`, which layers onto the image above.
 
+SUMO traffic lights drive the CARLA ones when `run_cosim` gets `--sync_tls`
+(with the compose file, `TERASIM_EXTRA_ARGS=--sync_tls`). The SUMO network then
+needs `linkSignalID:<linkIndex>` parameters naming the OpenDRIVE signal of each
+connection; `scripts/generate_tls_linksignal_params.py` adds them from the
+mappings produced at map conversion.
+
 ## **📄 License**
 
 - **TeraSim Core and other packages**: Apache 2.0 License
