@@ -18,6 +18,7 @@ from .ackermann_control import (
     compute_ackermann_control_values,
     compute_direct_brake_value,
     horizontal_speed,
+    world_to_vehicle_2d,
 )
 from .tools import (
     carla_to_sumo,
@@ -40,6 +41,7 @@ AV_SUMO_ID = "AV"
 SUMO_CARLA_TLS_LINK_PREFIX = "linkSignalID:"
 VEHICLE_CONTROL_MODE_TELEPORT = "teleport"
 VEHICLE_CONTROL_MODE_ACKERMANN_PHYSICS = "ackermann_physics"
+ACKERMANN_LONGITUDINAL_TARGET_MODE_ONE_STEP = "one_step"
 
 
 def _env_float(name, default):
@@ -76,7 +78,7 @@ class CarlaCosim(object):
         self.args = args
 
         self.client = carla.Client(args.carla_host, args.carla_port)
-        self.client.set_timeout(getattr(args, 'carla_timeout', 10.0))
+        self.client.set_timeout(getattr(args, "carla_timeout", 10.0))
 
         self.world = self.client.get_world()
         if args.map_name:
@@ -131,20 +133,12 @@ class CarlaCosim(object):
         self.ackermann_physics_enabled = (
             self.vehicle_control_mode == VEHICLE_CONTROL_MODE_ACKERMANN_PHYSICS
         )
-        feedback_mode = os.environ.get(
-            "CARLA_COSIM_ACKERMANN_FEEDBACK_MODE", "off"
-        ).strip().lower()
+        feedback_mode = os.environ.get("CARLA_COSIM_ACKERMANN_FEEDBACK_MODE", "off").strip().lower()
         if feedback_mode not in {"off", "shadow", "apply"}:
-            raise ValueError(
-                "CARLA_COSIM_ACKERMANN_FEEDBACK_MODE must be off, shadow, or apply"
-            )
-        feedback_actor_value = os.environ.get(
-            "CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS", ""
-        )
+            raise ValueError("CARLA_COSIM_ACKERMANN_FEEDBACK_MODE must be off, shadow, or apply")
+        feedback_actor_value = os.environ.get("CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS", "")
         self.ackermann_feedback_actor_ids = {
-            actor_id.strip()
-            for actor_id in feedback_actor_value.split(",")
-            if actor_id.strip()
+            actor_id.strip() for actor_id in feedback_actor_value.split(",") if actor_id.strip()
         }
         self.ackermann_feedback_apply_enabled = bool(
             self.ackermann_physics_enabled
@@ -157,7 +151,7 @@ class CarlaCosim(object):
                     "physical co-sim requires --tick_mode master so Phase A/B "
                     "and CARLA frames remain serial"
                 )
-            if AV_SUMO_ID in self.ackermann_feedback_actor_ids:
+            if self.control_av and AV_SUMO_ID in self.ackermann_feedback_actor_ids:
                 raise ValueError(
                     "Autoware owns the AV; physical feedback actors must be "
                     "background SUMO IDs or '*'"
@@ -166,6 +160,18 @@ class CarlaCosim(object):
         self._physics_feedback_frames = {}
         self._physics_feedback_failures = {}
         self._pending_authoritative_action_error = None
+        self.ackermann_background_invalid_policy = (
+            os.environ.get("CARLA_COSIM_ACKERMANN_BACKGROUND_INVALID_POLICY", "demote")
+            .strip()
+            .lower()
+        )
+        if self.ackermann_background_invalid_policy not in {"abort", "demote"}:
+            raise ValueError(
+                "CARLA_COSIM_ACKERMANN_BACKGROUND_INVALID_POLICY must be abort or demote"
+            )
+        self._pending_background_demotions = {}
+        self._physics_quarantined_vehicle_ids = {}
+        self._background_demotion_history = []
         self._ackermann_feedback_state = {}
         self._ackermann_fail_closed_reasons = {}
         self.ackermann_feedback_ack_max_frame_lag = max(
@@ -174,6 +180,11 @@ class CarlaCosim(object):
         self.ackermann_feedback_ack_failure_limit = max(
             1, _env_int("CARLA_COSIM_ACKERMANN_FEEDBACK_ACK_FAILURE_LIMIT", 3)
         )
+        self.ackermann_max_lateral_accel = max(
+            0.0,
+            _env_float("CARLA_COSIM_ACKERMANN_MAX_LATERAL_ACCEL", 0.0),
+        )
+        self.ackermann_longitudinal_target_mode = ACKERMANN_LONGITUDINAL_TARGET_MODE_ONE_STEP
         ackermann_restart_enter_speed = max(
             0.0,
             _env_float("CARLA_COSIM_ACKERMANN_RESTART_ENTER_SPEED", 0.05),
@@ -183,17 +194,16 @@ class CarlaCosim(object):
             _env_float("CARLA_COSIM_ACKERMANN_RESTART_RELEASE_SPEED", 0.2),
         )
         self.ackermann_tuning = AckermannTuning(
-            wheel_base=max(
-                0.1, _env_float("CARLA_COSIM_ACKERMANN_WHEEL_BASE", 2.8)
-            ),
-            max_steer_rad=max(
-                0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_STEER_RAD", 0.6)
-            ),
+            wheel_base=max(0.1, _env_float("CARLA_COSIM_ACKERMANN_WHEEL_BASE", 2.8)),
+            lateral_gain=max(0.0, _env_float("CARLA_COSIM_ACKERMANN_LATERAL_GAIN", 1.0)),
+            max_steer_rad=max(0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_STEER_RAD", 0.6)),
             max_steer_rate_rad_s=max(
                 0.0,
-                _env_float(
-                    "CARLA_COSIM_ACKERMANN_MAX_STEER_RATE_RAD_S", 0.6
-                ),
+                _env_float("CARLA_COSIM_ACKERMANN_MAX_STEER_RATE_RAD_S", 0.6),
+            ),
+            lateral_low_speed_blend_end=max(
+                1e-6,
+                _env_float("CARLA_COSIM_ACKERMANN_LATERAL_LOW_SPEED_BLEND_END", 0.5),
             ),
             position_speed_gain=max(
                 0.0,
@@ -201,12 +211,8 @@ class CarlaCosim(object):
             ),
             kp_speed=_env_float("CARLA_COSIM_ACKERMANN_KP_SPEED", 0.8),
             kp_position=_env_float("CARLA_COSIM_ACKERMANN_KP_POSITION", 0.15),
-            max_accel=max(
-                0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_ACCEL", 3.0)
-            ),
-            max_decel=max(
-                0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_DECEL", 6.0)
-            ),
+            max_accel=max(0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_ACCEL", 3.0)),
+            max_decel=max(0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_DECEL", 6.0)),
             restart_enter_speed=ackermann_restart_enter_speed,
             restart_release_speed=ackermann_restart_release_speed,
             restart_speed_epsilon=max(
@@ -221,51 +227,35 @@ class CarlaCosim(object):
         self.ackermann_controller_tuning = AckermannControllerTuning(
             speed_kp=max(
                 0.0,
-                _env_float(
-                    "CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KP", 1.0
-                ),
+                _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KP", 1.0),
             ),
             speed_ki=max(
                 0.0,
-                _env_float(
-                    "CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KI", 0.0
-                ),
+                _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KI", 0.0),
             ),
             speed_kd=max(
                 0.0,
-                _env_float(
-                    "CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KD", 0.0
-                ),
+                _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KD", 0.0),
             ),
             accel_kp=max(
                 0.0,
-                _env_float(
-                    "CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KP", 0.05
-                ),
+                _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KP", 0.05),
             ),
             accel_ki=max(
                 0.0,
-                _env_float(
-                    "CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KI", 0.0
-                ),
+                _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KI", 0.0),
             ),
             accel_kd=max(
                 0.0,
-                _env_float(
-                    "CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KD", 0.0
-                ),
+                _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KD", 0.0),
             ),
         )
         emergency_engage_decel = max(
             0.0,
-            _env_float(
-                "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_ENGAGE_DECEL", 4.0
-            ),
+            _env_float("CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_ENGAGE_DECEL", 4.0),
         )
         self.ackermann_emergency_brake_tuning = AckermannEmergencyBrakeTuning(
-            enabled=_env_bool(
-                "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_ENABLED", True
-            ),
+            enabled=_env_bool("CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_ENABLED", True),
             engage_decel=emergency_engage_decel,
             release_decel=min(
                 emergency_engage_decel,
@@ -279,23 +269,17 @@ class CarlaCosim(object):
             ),
             release_ticks=max(
                 1,
-                _env_int(
-                    "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_RELEASE_TICKS", 3
-                ),
+                _env_int("CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_RELEASE_TICKS", 3),
             ),
             stop_speed=max(
                 0.0,
-                _env_float(
-                    "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_STOP_SPEED", 0.2
-                ),
+                _env_float("CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_STOP_SPEED", 0.2),
             ),
             min_brake=min(
                 1.0,
                 max(
                     0.0,
-                    _env_float(
-                        "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_MIN_BRAKE", 0.5
-                    ),
+                    _env_float("CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_MIN_BRAKE", 0.5),
                 ),
             ),
         )
@@ -309,19 +293,35 @@ class CarlaCosim(object):
         self.ackermann_warning_interval = max(
             0.0, _env_float("CARLA_COSIM_ACKERMANN_WARNING_INTERVAL", 2.0)
         )
+        self.canonical_target_error_warn_m = max(
+            0.0,
+            _env_float(
+                "CARLA_COSIM_CANONICAL_TARGET_ERROR_WARN_M",
+                0.30,
+            ),
+        )
         self.ackermann_control_log_records = _env_bool(
             "CARLA_COSIM_ACKERMANN_CONTROL_LOG_RECORDS", False
         )
-        control_log_actor_value = os.environ.get(
-            "CARLA_COSIM_ACKERMANN_CONTROL_LOG_ACTORS", ""
-        )
+        self.ackermann_control_trace_path = os.environ.get(
+            "CARLA_COSIM_ACKERMANN_CONTROL_TRACE_FILE", ""
+        ).strip()
+        self.actor_mode_trace_path = os.environ.get("CARLA_COSIM_ACTOR_MODE_TRACE_FILE", "").strip()
+        control_log_actor_value = os.environ.get("CARLA_COSIM_ACKERMANN_CONTROL_LOG_ACTORS", "")
         self.ackermann_control_log_actor_ids = {
-            actor_id.strip()
-            for actor_id in control_log_actor_value.split(",")
-            if actor_id.strip()
+            actor_id.strip() for actor_id in control_log_actor_value.split(",") if actor_id.strip()
         }
+        self.background_collision_policy = (
+            os.environ.get("CARLA_COSIM_BACKGROUND_COLLISION_POLICY", "report").strip().lower()
+        )
+        if self.background_collision_policy not in {"report", "remove"}:
+            raise ValueError("CARLA_COSIM_BACKGROUND_COLLISION_POLICY must be report or remove")
+        self._pending_collision_vehicle_removals = {}
+        self._collision_vehicle_removal_tombstones = {}
+        self._collision_vehicle_removal_history = []
         self.collision_sensor_enabled = _env_bool(
-            "CARLA_COSIM_COLLISION_SENSOR_ENABLED", False
+            "CARLA_COSIM_COLLISION_SENSOR_ENABLED",
+            self.background_collision_policy == "remove",
         )
         self.collision_log_path = os.environ.get(
             "CARLA_COSIM_COLLISION_LOG", "/app/outputs/carla_collision_events.jsonl"
@@ -340,6 +340,8 @@ class CarlaCosim(object):
             "/app/outputs/carla_physics_initialization.jsonl",
         ).strip()
         self._diagnostic_lock = threading.Lock()
+        if self.ackermann_control_log_records and self.ackermann_control_trace_path:
+            self._reset_diagnostic_path(self.ackermann_control_trace_path)
         self._collision_sensors = {}
         self._collision_seen_frame_pairs = set()
         self._collision_last_pair_frame = {}
@@ -347,17 +349,34 @@ class CarlaCosim(object):
         self._collision_unique_frame_count = 0
         self._collision_episode_count = 0
         self._collision_episode_counts_by_pair = {}
+        self._initialization_contact_warning_seen_frame_pairs = set()
+        self._initialization_contact_warning_last_pair_frame = {}
+        self._initialization_contact_warning_event_count = 0
+        self._initialization_contact_warning_episode_count = 0
+        self._initialization_contact_warning_counts_by_vehicle = {}
+        self._collision_recovery_warning_seen_frame_pairs = set()
+        self._collision_recovery_warning_last_pair_frame = {}
+        self._collision_recovery_warning_event_count = 0
+        self._collision_recovery_warning_episode_count = 0
+        self._collision_recovery_warning_counts_by_vehicle = {}
         self._initialization_failure_counts = {}
+        if self.actor_mode_trace_path:
+            self._reset_diagnostic_path(self.actor_mode_trace_path)
         if self.collision_sensor_enabled:
             self._reset_diagnostic_path(self.collision_log_path)
             self._reset_diagnostic_path(self.collision_summary_path)
         if self.initialization_diagnostics_enabled:
             self._reset_diagnostic_path(self.initialization_log_path)
         if self.ackermann_feedback_apply_enabled:
+            ownership_message = (
+                "external ego remains externally owned."
+                if self.control_av
+                else "including SUMO AV; no external ego controller is used."
+            )
             print(
-                "CARLA physical co-sim enabled for SUMO background actors "
+                "CARLA physical co-sim enabled for SUMO actors "
                 f"{sorted(self.ackermann_feedback_actor_ids)!r}; "
-                "Autoware ego remains externally owned.",
+                f"{ownership_message}",
                 flush=True,
             )
         # go; debt beyond it is dropped (SUMO slow motion, never a long step
@@ -399,7 +418,10 @@ class CarlaCosim(object):
             or self.ackermann_feedback_apply_enabled,
         )
         if self.use_lane_relative_position:
-            print("CARLA co-sim lane-relative reconstructed positions enabled.", flush=True)
+            print(
+                "CARLA co-sim lane-relative reconstructed positions enabled.",
+                flush=True,
+            )
         self.spawn_failure_backoff_seconds = max(
             0.0,
             _env_float("CARLA_COSIM_SPAWN_FAILURE_BACKOFF_SECONDS", 5.0),
@@ -434,15 +456,46 @@ class CarlaCosim(object):
             0.0,
             _env_float("CARLA_COSIM_ACTOR_FILTER_RADIUS", 300.0),
         )
+        self.actor_filter_hysteresis = max(
+            0.0,
+            _env_float("CARLA_COSIM_ACTOR_FILTER_HYSTERESIS", 20.0),
+        )
+        self._actor_filter_active_vehicle_ids = set()
         self._actor_filter_missing_center_warned = False
         if self.actor_filter_enabled:
             print(
                 "CARLA co-sim actor radius filter enabled: "
                 f"center={self.actor_filter_center_id} "
-                f"radius={self.actor_filter_radius:.1f}m.",
+                f"enterRadius={self.actor_filter_radius:.1f}m "
+                f"exitRadius="
+                f"{self.actor_filter_radius + self.actor_filter_hysteresis:.1f}m.",
                 flush=True,
             )
 
+        self.physics_radius = max(
+            0.0,
+            _env_float("CARLA_COSIM_PHYSICS_RADIUS", 0.0),
+        )
+        self.physics_radius_enabled = self.physics_radius > 0.0
+        self.physics_radius_center_id = (
+            os.environ.get("CARLA_COSIM_PHYSICS_RADIUS_CENTER_ID") or AV_SUMO_ID
+        )
+        self._physics_actor_distances = {}
+        self._actor_sync_modes = {}
+        self.physics_radius_hysteresis = max(
+            0.0,
+            _env_float("CARLA_COSIM_PHYSICS_RADIUS_HYSTERESIS", 10.0),
+        )
+        self._physics_active_vehicle_ids = set()
+        if self.physics_radius_enabled:
+            print(
+                "CARLA co-sim physics radius enabled: "
+                f"center={self.physics_radius_center_id} "
+                f"enterRadius={self.physics_radius:.1f}m "
+                f"exitRadius="
+                f"{self.physics_radius + self.physics_radius_hysteresis:.1f}m.",
+                flush=True,
+            )
         # Per-tick CARLA round-trips replaced by caches. Every RPC on this
         # thread runs while holding the GIL, so beyond its own latency it
         # stalls the sim thread's Python phases (command apply / state build).
@@ -495,7 +548,9 @@ class CarlaCosim(object):
             if result is not None:
                 # Offset-based mode
                 self.sumo_carla_offset = result
-                print(f"SUMO-CARLA coordinate offset: dx={self.sumo_carla_offset[0]:.2f}, dy={self.sumo_carla_offset[1]:.2f}")
+                print(
+                    f"SUMO-CARLA coordinate offset: dx={self.sumo_carla_offset[0]:.2f}, dy={self.sumo_carla_offset[1]:.2f}"
+                )
             else:
                 print("Using projection-based coordinate transformation")
 
@@ -503,12 +558,14 @@ class CarlaCosim(object):
     def _get_net_file_from_config(config_path):
         """Extract SUMO net file path from the TeraSim scenario YAML config."""
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 config = yaml.safe_load(f)
             # Try input.sumo_net_file first, then environment.parameters.sumo_net_file_path
-            net_file = config.get('input', {}).get('sumo_net_file')
+            net_file = config.get("input", {}).get("sumo_net_file")
             if not net_file:
-                net_file = config.get('environment', {}).get('parameters', {}).get('sumo_net_file_path')
+                net_file = (
+                    config.get("environment", {}).get("parameters", {}).get("sumo_net_file_path")
+                )
             return net_file
         except Exception as e:
             print(f"Warning: Could not read config for net file path: {e}")
@@ -520,13 +577,13 @@ class CarlaCosim(object):
         Returns (origin_lat, origin_lon, utm_zone) or (None, None, None) if not parseable.
         """
         lat_0 = lon_0 = utm_zone = None
-        m = re.search(r'\+lat_0=([0-9.eE+-]+)', xodr_proj)
+        m = re.search(r"\+lat_0=([0-9.eE+-]+)", xodr_proj)
         if m:
             lat_0 = float(m.group(1))
-        m = re.search(r'\+lon_0=([0-9.eE+-]+)', xodr_proj)
+        m = re.search(r"\+lon_0=([0-9.eE+-]+)", xodr_proj)
         if m:
             lon_0 = float(m.group(1))
-        m = re.search(r'\+zone=(\d+)', xodr_proj)
+        m = re.search(r"\+zone=(\d+)", xodr_proj)
         if m:
             utm_zone = int(m.group(1))
         return lat_0, lon_0, utm_zone
@@ -550,11 +607,11 @@ class CarlaCosim(object):
         try:
             tree = ET.parse(net_file)
             root = tree.getroot()
-            loc_elem = root.find('.//location')
+            loc_elem = root.find(".//location")
             if loc_elem is not None:
-                sumo_proj = loc_elem.get('projParameter', '!')
-                offset_str = loc_elem.get('netOffset', '0.00,0.00')
-                parts = offset_str.split(',')
+                sumo_proj = loc_elem.get("projParameter", "!")
+                offset_str = loc_elem.get("netOffset", "0.00,0.00")
+                parts = offset_str.split(",")
                 sumo_net_offset = [float(parts[0]), float(parts[1])]
                 print(f"SUMO net.xml: projParameter='{sumo_proj}', netOffset={sumo_net_offset}")
         except Exception as e:
@@ -565,7 +622,7 @@ class CarlaCosim(object):
         try:
             opendrive_str = self.world.get_map().to_opendrive()
             xodr_tree = ET.fromstring(opendrive_str)
-            geo_elem = xodr_tree.find('.//geoReference')
+            geo_elem = xodr_tree.find(".//geoReference")
             if geo_elem is not None and geo_elem.text:
                 xodr_proj = geo_elem.text.strip()
                 print(f"CARLA xodr geoReference: '{xodr_proj}'")
@@ -582,52 +639,60 @@ class CarlaCosim(object):
 
                 # Determine SUMO CRS
                 sumo_crs = None
-                if sumo_proj and sumo_proj != '!':
+                if sumo_proj and sumo_proj != "!":
                     sumo_crs = pyproj.CRS(sumo_proj)
-                elif sumo_proj == '!':
+                elif sumo_proj == "!":
                     # Detect CRS empirically from coordinate ranges
                     tree = ET.parse(net_file)
                     root = tree.getroot()
-                    conv_boundary = root.find('.//location').get('convBoundary', '')
-                    cb_parts = conv_boundary.split(',')
+                    conv_boundary = root.find(".//location").get("convBoundary", "")
+                    cb_parts = conv_boundary.split(",")
                     sample_x = (float(cb_parts[0]) + float(cb_parts[2])) / 2
                     sample_y = (float(cb_parts[1]) + float(cb_parts[3])) / 2
 
-                    wgs84 = pyproj.CRS('EPSG:4326')
-                    for crs_code in ['EPSG:3857', 'EPSG:32654', 'EPSG:6677']:
+                    wgs84 = pyproj.CRS("EPSG:4326")
+                    for crs_code in ["EPSG:3857", "EPSG:32654", "EPSG:6677"]:
                         try:
                             candidate = pyproj.CRS(crs_code)
                             to_wgs84 = pyproj.Transformer.from_crs(candidate, wgs84, always_xy=True)
                             lon, lat = to_wgs84.transform(sample_x, sample_y)
                             if 100.0 < lon < 180.0 and -60.0 < lat < 85.0:
                                 sumo_crs = candidate
-                                print(f"Detected SUMO CRS as {crs_code} (sample -> lon={lon:.4f}, lat={lat:.4f})")
+                                print(
+                                    f"Detected SUMO CRS as {crs_code} (sample -> lon={lon:.4f}, lat={lat:.4f})"
+                                )
                                 break
                         except Exception:
                             continue
 
                 if sumo_crs is None:
-                    print("Warning: Could not determine SUMO CRS. Falling back to empirical calibration.")
+                    print(
+                        "Warning: Could not determine SUMO CRS. Falling back to empirical calibration."
+                    )
                     return self._empirical_calibration(net_file)
 
                 # Build transformer: SUMO CRS -> standard UTM (same zone as xodr)
                 if utm_zone:
-                    utm_crs = pyproj.CRS(f'EPSG:326{utm_zone:02d}')
+                    utm_crs = pyproj.CRS(f"EPSG:326{utm_zone:02d}")
                 else:
                     # Default to UTM zone from xodr proj string
                     utm_crs = pyproj.CRS(xodr_proj)
 
-                self._coord_transformer = pyproj.Transformer.from_crs(sumo_crs, utm_crs, always_xy=True)
+                self._coord_transformer = pyproj.Transformer.from_crs(
+                    sumo_crs, utm_crs, always_xy=True
+                )
                 self._sumo_net_offset = sumo_net_offset
 
                 # Compute xodr origin in standard UTM
                 self._xodr_origin_utm = [0.0, 0.0]
                 if origin_lat is not None and origin_lon is not None:
-                    wgs84 = pyproj.CRS('EPSG:4326')
+                    wgs84 = pyproj.CRS("EPSG:4326")
                     to_utm = pyproj.Transformer.from_crs(wgs84, utm_crs, always_xy=True)
                     ox, oy = to_utm.transform(origin_lon, origin_lat)
                     self._xodr_origin_utm = [ox, oy]
-                    print(f"xodr origin ({origin_lat:.6f}, {origin_lon:.6f}) in UTM: ({ox:.2f}, {oy:.2f})")
+                    print(
+                        f"xodr origin ({origin_lat:.6f}, {origin_lon:.6f}) in UTM: ({ox:.2f}, {oy:.2f})"
+                    )
 
                 print(f"Using projection-based transform: SUMO -> UTM{utm_zone} - origin")
                 return None  # Signal to use transformer instead of offset
@@ -635,6 +700,7 @@ class CarlaCosim(object):
             except Exception as e:
                 print(f"Warning: Projection-based calibration failed: {e}")
                 import traceback
+
                 traceback.print_exc()
 
         # Fallback: empirical median-based calibration
@@ -646,14 +712,14 @@ class CarlaCosim(object):
         try:
             tree = ET.parse(net_file)
             root = tree.getroot()
-            for edge_elem in root.iter('edge'):
-                edge_id = edge_elem.get('id', '')
-                if edge_id.startswith(':'):
+            for edge_elem in root.iter("edge"):
+                edge_id = edge_elem.get("id", "")
+                if edge_id.startswith(":"):
                     continue
-                for lane_elem in edge_elem.iter('lane'):
-                    shape_str = lane_elem.get('shape', '')
+                for lane_elem in edge_elem.iter("lane"):
+                    shape_str = lane_elem.get("shape", "")
                     if shape_str:
-                        points = [tuple(map(float, p.split(','))) for p in shape_str.split()]
+                        points = [tuple(map(float, p.split(","))) for p in shape_str.split()]
                         mid = points[len(points) // 2]
                         sumo_edges[edge_id] = (mid[0], mid[1])
                         break
@@ -691,7 +757,7 @@ class CarlaCosim(object):
     def _is_ackermann_feedback_actor(self, actor_id):
         return bool(
             self.ackermann_feedback_apply_enabled
-            and actor_id != AV_SUMO_ID
+            and (actor_id != AV_SUMO_ID or not getattr(self, "control_av", True))
             and (
                 actor_id in self.ackermann_feedback_actor_ids
                 or "*" in self.ackermann_feedback_actor_ids
@@ -699,15 +765,171 @@ class CarlaCosim(object):
         )
 
     def _uses_ackermann_physics(self, actor_id):
-        return self._is_ackermann_feedback_actor(actor_id)
+        if not getattr(self, "ackermann_physics_enabled", False):
+            return False
+        if getattr(self, "physics_radius_enabled", False):
+            return actor_id in self._physics_active_vehicle_ids
+        if getattr(self, "ackermann_feedback_apply_enabled", False):
+            return self._is_ackermann_feedback_actor(actor_id)
+        return True
 
     def _waits_for_first_phase_a_feedback(self, actor_id):
-        """Keep non-master actors coasting until their first feedback is queued."""
+        """Keep actors coasting until their first Phase A feedback is queued.
+
+        Master applies the prior SUMO state before advancing CARLA, so the
+        stabilization-complete frame has no feedback-derived SUMO action yet.
+        Wait in every clock mode until that first feedback has been queued.
+        """
         return bool(
-            not getattr(self, "tick_master", False)
+            self._uses_ackermann_physics(actor_id)
             and self._is_ackermann_feedback_actor(actor_id)
             and actor_id not in self._physics_feedback_frames
         )
+
+    @staticmethod
+    def _physics_feedback_seed_ready(state):
+        """Allow observation-only feedback after physics has safely started."""
+        return bool(
+            state.get("physics_initialization_pending")
+            and state.get("physics_enabled")
+            and state.get("physics_stabilization_pending")
+            and not state.get("physics_ground_transform_wait_pending")
+            and not state.get("physics_overlap_deferred")
+            and not state.get("physics_initialization_abandoned")
+        )
+
+    def _start_physics_feedback_seed(self, actor_id, state, reason):
+        generation = int(state.get("physics_initialization_generation", 0)) + 1
+        state["physics_initialization_generation"] = generation
+        state["physics_feedback_seed_pending"] = True
+        state["physics_feedback_seed_complete"] = False
+        state["physics_feedback_seed_sent_frames"] = 0
+        state["physics_feedback_seed_acknowledged_frames"] = 0
+        state["physics_feedback_seed_first_sent_frame"] = None
+        state["physics_feedback_seed_first_frame"] = None
+        state["physics_feedback_seed_last_frame"] = None
+        state["physics_feedback_seed_last_ack_frame"] = None
+        state["physics_feedback_seed_started_with_maneuver"] = False
+        state["physics_feedback_seed_first_intent"] = "none"
+        state["physics_feedback_seed_first_lane_id"] = ""
+        state["physics_feedback_seed_first_canonical_d"] = None
+        state["physics_feedback_seed_failure_reason"] = ""
+        state["physics_feedback_seed_handoff_warning"] = ""
+        state["physics_feedback_seed_completed_while_armed"] = False
+        state["physics_feedback_seed_start_reason"] = reason
+        state["physics_feedback_seed_start_frame"] = getattr(self, "_last_world_frame", None)
+        state["physics_feedback_seed_start_time"] = (
+            getattr(self, "_inproc_prev_state", None) or {}
+        ).get("simulation_time")
+        state.pop("physics_feedback_seed_complete_frame", None)
+        state.pop("physics_feedback_seed_complete_time", None)
+        state.pop("physics_control_start_frame", None)
+        state.pop("physics_control_start_phase", None)
+        state.pop("physics_control_start_target_d", None)
+        for attribute in (
+            "_physics_feedback_frames",
+            "_physics_feedback_failures",
+            "_ackermann_feedback_state",
+        ):
+            cache = getattr(self, attribute, None)
+            if cache is None:
+                cache = {}
+                setattr(self, attribute, cache)
+            cache.pop(actor_id, None)
+        return generation
+
+    def _acknowledge_physics_feedback_seed(self, actor_id, vehicle_info, state):
+        if not vehicle_info.get("feedback_physics_seed_only", False):
+            return
+        generation = vehicle_info.get("feedback_initialization_generation")
+        if generation != state.get("physics_initialization_generation"):
+            return
+        source_frame = vehicle_info.get("feedback_source_carla_frame")
+        if not isinstance(source_frame, int):
+            return
+        previous_frame = state.get("physics_feedback_seed_last_ack_frame")
+        if isinstance(previous_frame, int) and source_frame <= previous_frame:
+            return
+        state["physics_feedback_seed_last_ack_frame"] = source_frame
+        state["physics_feedback_seed_acknowledged_frames"] = (
+            int(state.get("physics_feedback_seed_acknowledged_frames", 0)) + 1
+        )
+        if state.get("physics_feedback_seed_first_frame") is None:
+            state["physics_feedback_seed_first_frame"] = source_frame
+            state["physics_feedback_seed_first_intent"] = vehicle_info.get(
+                "sumo_lane_change_intent", "none"
+            )
+            state["physics_feedback_seed_first_lane_id"] = vehicle_info.get("lane_id", "")
+            state["physics_feedback_seed_first_canonical_d"] = self._as_finite_float(
+                vehicle_info.get("canonical_phase_b_d")
+            )
+        if vehicle_info.get("external_state_maneuver_phase") in {
+            "armed",
+            "active",
+            "hold",
+        } or vehicle_info.get("external_state_maneuver_intent_evidence", False):
+            state["physics_feedback_seed_started_with_maneuver"] = True
+
+    def _physics_feedback_seed_control_gate(self, actor_id, vehicle_info, state):
+        """Return (ready, failure_reason) for the first physics control frame."""
+        if not state.get("physics_feedback_seed_pending", False):
+            return True, ""
+        acknowledged = int(state.get("physics_feedback_seed_acknowledged_frames", 0))
+        minimum_frames = int(self.ACKERMANN_SPAWN_STABILITY_TICKS)
+        if acknowledged < minimum_frames:
+            return False, ""
+
+        if not vehicle_info.get("lookahead_action_valid", False):
+            return False, "physics_seed_invalid_action:" + str(
+                vehicle_info.get("lookahead_action_error") or "unknown"
+            )
+
+        phase = vehicle_info.get("external_state_maneuver_phase", "lane_keep")
+        canonical_motion = bool(
+            vehicle_info.get("external_state_maneuver_canonical_motion_evidence", False)
+        )
+        speed_motion = bool(
+            vehicle_info.get("external_state_maneuver_speed_motion_evidence", False)
+        )
+        authorized = bool(
+            vehicle_info.get("external_state_maneuver_authorized", False)
+            or state.get("physics_feedback_seed_started_with_maneuver", False)
+        )
+        if phase == "lane_keep" and (canonical_motion or speed_motion) and not authorized:
+            state["physics_feedback_seed_handoff_warning"] = (
+                "physics_seed_uncommanded_lateral_motion"
+            )
+            print(
+                "Warning: physical feedback seed completed with uncommanded "
+                f"lateral motion for {actor_id!r}; starting lane-keep control",
+                flush=True,
+            )
+
+        if phase == "armed":
+            # LCA_LEFT/LCA_RIGHT describes SUMO's current lane-change desire,
+            # not a committed maneuver. A blocked desire may stay asserted
+            # indefinitely and later begin moving without another rising edge.
+            # Keep the passive armed state, start normal control, and let the
+            # existing three-frame canonical-motion test confirm active.
+            state["physics_feedback_seed_completed_while_armed"] = True
+
+        expected_frame = self._physics_feedback_frames.get(actor_id)
+        acknowledged_frame = vehicle_info.get("feedback_source_carla_frame")
+        if expected_frame is None or acknowledged_frame != expected_frame:
+            return False, ""
+
+        state["physics_feedback_seed_pending"] = False
+        state["physics_feedback_seed_complete"] = True
+        state["physics_feedback_seed_complete_frame"] = acknowledged_frame
+        state["physics_feedback_seed_complete_time"] = (self._inproc_prev_state or {}).get(
+            "simulation_time"
+        )
+        state["physics_control_start_frame"] = self._last_world_frame
+        state["physics_control_start_phase"] = phase
+        state["physics_control_start_target_d"] = self._as_finite_float(
+            vehicle_info.get("external_state_maneuver_target_selected_d")
+        )
+        return True, ""
 
     def _carla_transform_to_sumo_feedback_state(
         self,
@@ -737,12 +959,8 @@ class CarlaCosim(object):
                 2.8,
             )
 
-        front_point = self._transform_local_x_point(
-            transform, front_bumper_local_x
-        )
-        rear_axle_point = self._transform_local_x_point(
-            transform, rear_axle_local_x
-        )
+        front_point = self._transform_local_x_point(transform, front_bumper_local_x)
+        rear_axle_point = self._transform_local_x_point(transform, rear_axle_local_x)
         sumo_location = self._carla_point_to_sumo_position(*front_point)
         rear_axle_location = self._carla_point_to_sumo_position(*rear_axle_point)
         sumo_rotation = [rotation.pitch, carla_yaw + 90.0, rotation.roll]
@@ -775,15 +993,18 @@ class CarlaCosim(object):
         state = self._ackermann_actor_state.setdefault(actor_id, {})
         self._initialize_ackermann_actor_geometry(actor, actor_id, state)
         transform = actor.get_transform()
+        front_bumper_local_x = state.get("front_bumper_local_x_m", shape[0] / 2.0)
+        rear_axle_local_x = state.get(
+            "rear_axle_local_x_m", -0.5 * self.ackermann_tuning.wheel_base
+        )
+        front_to_rear_axle_distance = self._as_finite_float(
+            front_bumper_local_x - rear_axle_local_x
+        )
         sumo_state = self._carla_transform_to_sumo_feedback_state(
             transform,
             shape,
-            front_bumper_local_x=state.get(
-                "front_bumper_local_x_m", shape[0] / 2.0
-            ),
-            rear_axle_local_x=state.get(
-                "rear_axle_local_x_m", -0.5 * self.ackermann_tuning.wheel_base
-            ),
+            front_bumper_local_x=front_bumper_local_x,
+            rear_axle_local_x=rear_axle_local_x,
         )
         velocity = actor.get_velocity()
         acceleration = actor.get_acceleration()
@@ -797,7 +1018,13 @@ class CarlaCosim(object):
             longitudinal_acceleration = self._as_finite_float(
                 acceleration_x * math.cos(yaw) + acceleration_y * math.sin(yaw)
             )
-        if sumo_state is None or speed is None or longitudinal_acceleration is None:
+        if (
+            sumo_state is None
+            or speed is None
+            or longitudinal_acceleration is None
+            or front_to_rear_axle_distance is None
+            or front_to_rear_axle_distance <= 0.0
+        ):
             raise ValueError("non_finite_feedback_state")
         return {
             "position": sumo_state["position"],
@@ -806,9 +1033,10 @@ class CarlaCosim(object):
             "acceleration": longitudinal_acceleration,
             "sumo_angle": sumo_state["sumo_angle"],
             "rear_axle_position": sumo_state["rear_axle_position"],
+            "front_to_rear_axle_distance": front_to_rear_axle_distance,
         }
 
-    def _build_physics_feedback_commands(self):
+    def _build_physics_feedback_commands(self):  # noqa: C901
         if not self.ackermann_feedback_apply_enabled:
             return []
         state = self._inproc_prev_state
@@ -826,35 +1054,40 @@ class CarlaCosim(object):
         # produce a different car-following decision for lane-changing actors.
         for actor_id in sorted(vehicles):
             vehicle_info = vehicles[actor_id]
-            if not self._is_ackermann_feedback_actor(actor_id):
+            if not self._is_ackermann_feedback_actor(actor_id) or not self._uses_ackermann_physics(
+                actor_id
+            ):
                 continue
             actor = self._vehicle_actor_index.get(actor_id)
             if actor is None:
                 continue
             actor_state = self._ackermann_actor_state.setdefault(actor_id, {})
-            if actor_state.get("physics_initialization_pending"):
+            initialization_pending = bool(actor_state.get("physics_initialization_pending"))
+            if initialization_pending and not self._physics_feedback_seed_ready(actor_state):
                 continue
+            seed_only = bool(actor_state.get("physics_feedback_seed_pending", False))
             previous_frame = self._physics_feedback_frames.get(actor_id)
             if previous_frame is not None and frame <= previous_frame:
                 reason = "stale_or_duplicate_carla_frame"
                 self._register_physics_feedback_failure(actor_id, reason)
-                self._apply_physics_fail_closed_brake(reason)
+                self._apply_feedback_failure_brake(actor_id, reason)
                 continue
             try:
-                feedback = self._carla_actor_to_sumo_feedback(
-                    actor_id, actor, vehicle_info
-                )
+                feedback = self._carla_actor_to_sumo_feedback(actor_id, actor, vehicle_info)
             except Exception as exc:
                 reason = f"feedback_collection:{type(exc).__name__}"
                 print(
-                    f"Warning: physical feedback collection failed for "
-                    f"{actor_id}: {exc}",
+                    f"Warning: physical feedback collection failed for " f"{actor_id}: {exc}",
                     flush=True,
                 )
                 self._register_physics_feedback_failure(actor_id, reason)
-                self._apply_physics_fail_closed_brake(reason)
+                self._apply_feedback_failure_brake(actor_id, reason)
                 continue
             feedback["source_carla_frame"] = frame
+            feedback["physics_seed_only"] = seed_only
+            feedback["physics_initialization_generation"] = int(
+                actor_state.get("physics_initialization_generation", 0)
+            )
             commands.append(
                 {
                     "agent_id": actor_id,
@@ -864,9 +1097,28 @@ class CarlaCosim(object):
                 }
             )
             self._physics_feedback_frames[actor_id] = frame
+            if seed_only:
+                actor_state["physics_feedback_seed_sent_frames"] = (
+                    int(actor_state.get("physics_feedback_seed_sent_frames", 0)) + 1
+                )
+                actor_state["physics_feedback_seed_last_frame"] = frame
+                if actor_state.get("physics_feedback_seed_first_sent_frame") is None:
+                    actor_state["physics_feedback_seed_first_sent_frame"] = frame
+                if actor_state.get("physics_feedback_seed_start_frame") is None:
+                    actor_state["physics_feedback_seed_start_frame"] = frame
+                self._record_actor_mode_transition(
+                    actor_id,
+                    "physics_seeding",
+                    reason="observation_only_feedback",
+                    initialization_generation=actor_state.get("physics_initialization_generation"),
+                )
             self._ackermann_feedback_state[actor_id] = {
                 "feedback_status": "queued",
                 "source_carla_frame": frame,
+                "physics_seed_only": seed_only,
+                "physics_initialization_generation": actor_state.get(
+                    "physics_initialization_generation", 0
+                ),
             }
             self._clear_physics_feedback_failure(actor_id)
         return commands
@@ -925,10 +1177,7 @@ class CarlaCosim(object):
         }
         self._set_ackermann_fail_closed_reason(actor_id, reason)
         if failures >= self.ackermann_feedback_ack_failure_limit:
-            self._pending_authoritative_action_error = {
-                "actor_id": actor_id,
-                "reason": reason,
-            }
+            self._queue_authoritative_failure(actor_id, reason)
         return failures
 
     def _clear_physics_feedback_failure(self, actor_id):
@@ -937,7 +1186,11 @@ class CarlaCosim(object):
     def _apply_physics_fail_closed_brake(self, reason):
         count = 0
         for actor_id, actor in list((self._vehicle_actor_index or {}).items()):
-            if actor is None or not self._is_ackermann_feedback_actor(actor_id):
+            if (
+                actor is None
+                or not self._is_ackermann_feedback_actor(actor_id)
+                or not self._uses_ackermann_physics(actor_id)
+            ):
                 continue
             try:
                 actor.apply_control(self._full_brake_control())
@@ -951,9 +1204,7 @@ class CarlaCosim(object):
             )
 
     def _sumo_point_to_carla_location(self, sumo_location, z_offset=0.0):
-        return sumo_point_to_carla(
-            sumo_location, self._get_carla_offset(sumo_location, z_offset)
-        )
+        return sumo_point_to_carla(sumo_location, self._get_carla_offset(sumo_location, z_offset))
 
     def _carla_point_to_sumo_position(self, carla_x, carla_y, carla_z=0.0):
         """Convert a physical CARLA point to SUMO coordinates without shape correction."""
@@ -982,16 +1233,15 @@ class CarlaCosim(object):
         step_length,
     ):
         """Compare both rear-axle positions at the SUMO target time t + dt."""
-        predicted_x = current_rear_axle[0] + float(
-            getattr(current_velocity, "x", 0.0)
-        ) * max(0.0, step_length)
-        predicted_y = current_rear_axle[1] + float(
-            getattr(current_velocity, "y", 0.0)
-        ) * max(0.0, step_length)
-        return (
-            (desired_rear_axle[0] - predicted_x) * math.cos(desired_heading)
-            + (desired_rear_axle[1] - predicted_y) * math.sin(desired_heading)
+        predicted_x = current_rear_axle[0] + float(getattr(current_velocity, "x", 0.0)) * max(
+            0.0, step_length
         )
+        predicted_y = current_rear_axle[1] + float(getattr(current_velocity, "y", 0.0)) * max(
+            0.0, step_length
+        )
+        return (desired_rear_axle[0] - predicted_x) * math.cos(desired_heading) + (
+            desired_rear_axle[1] - predicted_y
+        ) * math.sin(desired_heading)
 
     @classmethod
     def _phase_aligned_front_progress_error(
@@ -1011,12 +1261,8 @@ class CarlaCosim(object):
         with SUMO lane yaw would incorrectly turn heading error into longitudinal
         error on curves.
         """
-        current_front = cls._transform_local_x_point(
-            current_transform, front_bumper_local_x
-        )
-        desired_front = cls._transform_local_x_point(
-            desired_transform, front_bumper_local_x
-        )
+        current_front = cls._transform_local_x_point(current_transform, front_bumper_local_x)
+        desired_front = cls._transform_local_x_point(desired_transform, front_bumper_local_x)
         return cls._phase_aligned_longitudinal_error(
             current_front,
             desired_front,
@@ -1024,6 +1270,63 @@ class CarlaCosim(object):
             desired_heading,
             step_length,
         )
+
+    @classmethod
+    def _phase_aligned_front_lateral_error(
+        cls,
+        current_transform,
+        desired_transform,
+        front_bumper_local_x,
+        current_velocity,
+        desired_heading,
+        step_length,
+    ):
+        """Compare CARLA and SUMO front centers at the Phase B target time."""
+
+        current_front = cls._transform_local_x_point(current_transform, front_bumper_local_x)
+        desired_front = cls._transform_local_x_point(desired_transform, front_bumper_local_x)
+        predicted_x = current_front[0] + float(getattr(current_velocity, "x", 0.0)) * max(
+            0.0, step_length
+        )
+        predicted_y = current_front[1] + float(getattr(current_velocity, "y", 0.0)) * max(
+            0.0, step_length
+        )
+        error_x = desired_front[0] - predicted_x
+        error_y = desired_front[1] - predicted_y
+        return -error_x * math.sin(desired_heading) + error_y * math.cos(desired_heading)
+
+    @classmethod
+    def _phase_aligned_front_canonical_target_error(
+        cls,
+        current_transform,
+        desired_transform,
+        front_bumper_local_x,
+        current_velocity,
+        sumo_normal_x,
+        sumo_normal_y,
+        step_length,
+    ):
+        """Project the Phase-B front error onto the canonical SUMO normal."""
+
+        try:
+            normal_x = float(sumo_normal_x)
+            normal_y = float(sumo_normal_y)
+        except (TypeError, ValueError):
+            return None
+        normal_length = math.hypot(normal_x, normal_y)
+        if not math.isfinite(normal_length) or normal_length <= 1e-12:
+            return None
+        normal_x /= normal_length
+        normal_y /= normal_length
+        current_front = cls._transform_local_x_point(current_transform, front_bumper_local_x)
+        desired_front = cls._transform_local_x_point(desired_transform, front_bumper_local_x)
+        horizon = max(0.0, float(step_length))
+        predicted_x = current_front[0] + float(getattr(current_velocity, "x", 0.0)) * horizon
+        predicted_y = current_front[1] + float(getattr(current_velocity, "y", 0.0)) * horizon
+        error_x = desired_front[0] - predicted_x
+        error_y = desired_front[1] - predicted_y
+        # SUMO and CARLA share world X but use opposite world Y axes.
+        return error_x * normal_x - error_y * normal_y
 
     def _sumo_front_to_carla_transform(
         self,
@@ -1061,6 +1364,20 @@ class CarlaCosim(object):
             reason = veh_info.get("lookahead_action_error") or "invalid_action_geometry"
             raise ValueError(f"invalid authoritative SUMO lookahead for actor {veh_id}: {reason}")
 
+        if authoritative_feedback:
+            if bool(veh_info.get("steering_preview_position_valid", False)):
+                steering_preview = [
+                    self._as_finite_float(veh_info.get("steering_preview_x")),
+                    self._as_finite_float(veh_info.get("steering_preview_y")),
+                    self._as_finite_float(veh_info.get("steering_preview_z")),
+                ]
+                if steering_preview[2] is None:
+                    steering_preview[2] = sumo_location[2]
+                if steering_preview[0] is not None and steering_preview[1] is not None:
+                    return steering_preview
+                raise ValueError(f"invalid authoritative SUMO steering preview for actor {veh_id}")
+            raise ValueError(f"missing authoritative SUMO steering preview for actor {veh_id}")
+
         if bool(veh_info.get("lookahead_position_valid", False)):
             lookahead = [
                 self._as_finite_float(veh_info.get("lookahead_x")),
@@ -1076,14 +1393,6 @@ class CarlaCosim(object):
             ) and self._is_ackermann_feedback_apply_actor(veh_id):
                 raise ValueError(f"invalid authoritative SUMO lookahead for actor {veh_id}")
 
-        if authoritative_feedback and veh_info.get("lookahead_action_mode") in {
-            "route",
-            "route_only_unresolved_lateral",
-            "sumo_lateral_velocity",
-            "deferred",
-        }:
-            raise ValueError(f"missing authoritative SUMO lookahead for actor {veh_id}")
-
         desired_speed = self._resolve_ackermann_desired_speed(veh_id, veh_info)
         lookahead_distance = min(15.0, max(7.0, desired_speed))
         heading = math.radians(90.0 - sumo_angle)
@@ -1092,6 +1401,31 @@ class CarlaCosim(object):
             sumo_location[1] + math.sin(heading) * lookahead_distance,
             sumo_location[2],
         ]
+
+    def _resolve_authoritative_path_tracker(self, veh_info):
+        if not bool(veh_info.get("path_tracker_valid", False)):
+            raise ValueError("missing canonical path tracker reference")
+        field_names = (
+            "path_tracker_rear_curvature",
+            "path_tracker_reference_tangent_x",
+            "path_tracker_reference_tangent_y",
+            "path_tracker_front_cross_track_error",
+        )
+        values = [self._as_finite_float(veh_info.get(field)) for field in field_names]
+        if any(value is None for value in values):
+            raise ValueError("invalid canonical path tracker reference")
+        rear_curvature, tangent_x, tangent_y, cross_track_error = values
+        tangent_norm = math.hypot(tangent_x, tangent_y)
+        if tangent_norm <= 1e-9:
+            raise ValueError("degenerate canonical path tracker tangent")
+        return {
+            "path_curvature": -rear_curvature,
+            "path_heading_degrees": math.degrees(math.atan2(-tangent_y, tangent_x)),
+            "path_cross_track_error": -cross_track_error,
+            "sumo_rear_curvature": rear_curvature,
+            "sumo_reference_heading": math.atan2(tangent_y, tangent_x),
+            "sumo_front_cross_track_error": cross_track_error,
+        }
 
     @staticmethod
     def _set_actor_simulate_physics(actor, enabled):
@@ -1147,18 +1481,12 @@ class CarlaCosim(object):
         for axis in first["axes"] + second["axes"]:
             center_distance = abs(delta[0] * axis[0] + delta[1] * axis[1])
             first_radius = sum(
-                half_extent
-                * abs(local_axis[0] * axis[0] + local_axis[1] * axis[1])
-                for half_extent, local_axis in zip(
-                    first["half_extents"], first["axes"]
-                )
+                half_extent * abs(local_axis[0] * axis[0] + local_axis[1] * axis[1])
+                for half_extent, local_axis in zip(first["half_extents"], first["axes"])
             )
             second_radius = sum(
-                half_extent
-                * abs(local_axis[0] * axis[0] + local_axis[1] * axis[1])
-                for half_extent, local_axis in zip(
-                    second["half_extents"], second["axes"]
-                )
+                half_extent * abs(local_axis[0] * axis[0] + local_axis[1] * axis[1])
+                for half_extent, local_axis in zip(second["half_extents"], second["axes"])
             )
             if center_distance > first_radius + second_radius + clearance:
                 return False
@@ -1186,9 +1514,7 @@ class CarlaCosim(object):
                     continue
             if other_transform is None:
                 continue
-            other_footprint = self._ackermann_actor_footprint(
-                other_actor, other_transform
-            )
+            other_footprint = self._ackermann_actor_footprint(other_actor, other_transform)
             if other_footprint is not None and self._ackermann_footprints_overlap(
                 footprint, other_footprint
             ):
@@ -1219,6 +1545,7 @@ class CarlaCosim(object):
         elevated_transform,
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
+        self._start_physics_feedback_seed(veh_id, state, "physics_initialization_prepared")
         self._set_actor_simulate_physics(actor, False)
         self._zero_ackermann_actor_motion(actor)
         state["physics_enabled"] = False
@@ -1303,10 +1630,7 @@ class CarlaCosim(object):
     def _diagnostic_vector(vector):
         if vector is None:
             return None
-        return {
-            axis: float(getattr(vector, axis, 0.0))
-            for axis in ("x", "y", "z")
-        }
+        return {axis: float(getattr(vector, axis, 0.0)) for axis in ("x", "y", "z")}
 
     @classmethod
     def _diagnostic_transform(cls, transform):
@@ -1350,7 +1674,12 @@ class CarlaCosim(object):
             snapshot["control"] = {
                 name: getattr(control, name, None)
                 for name in (
-                    "throttle", "steer", "brake", "hand_brake", "reverse", "gear"
+                    "throttle",
+                    "steer",
+                    "brake",
+                    "hand_brake",
+                    "reverse",
+                    "gear",
                 )
             }
         except Exception:
@@ -1425,7 +1754,87 @@ class CarlaCosim(object):
         sensors[veh_id] = sensor
         return sensor
 
-    def _on_collision_event(self, veh_id, actor, event):
+    def _collision_state_vehicle_info(self, actor_id):
+        state = getattr(self, "_inproc_prev_state", None) or {}
+        return state.get("agent_details", {}).get("vehicle", {}).get(actor_id, {}) or {}
+
+    def _collision_deletable_background_actors(self, veh_id, actor, other):
+        protected = set(getattr(self.args, "protected_roles", None) or [AV_SUMO_ID])
+        protected.add(AV_SUMO_ID)
+        other_role = ""
+        try:
+            other_role = other.attributes.get("role_name", "")
+        except Exception:
+            pass
+        candidates = {veh_id: actor}
+        if other_role and str(getattr(other, "type_id", "")).startswith("vehicle."):
+            candidates[other_role] = other
+        actor_index = getattr(self, "_vehicle_actor_index", {})
+        return {
+            actor_id: candidate_actor
+            for actor_id, candidate_actor in candidates.items()
+            if actor_id and actor_id not in protected and actor_id in actor_index
+        }
+
+    def _schedule_collision_vehicle_removals(self, veh_id, actor, other, payload):
+        if getattr(self, "background_collision_policy", "report") != "remove":
+            return
+        if not payload.get("new_episode"):
+            return
+        candidates = self._collision_deletable_background_actors(veh_id, actor, other)
+        if not candidates:
+            return
+        other_role = ""
+        try:
+            other_role = other.attributes.get("role_name", "")
+        except Exception:
+            pass
+        scheduled = []
+        lock = getattr(self, "_diagnostic_lock", None) or threading.Lock()
+        with lock:
+            pending = self._pending_collision_vehicle_removals
+            tombstones = self._collision_vehicle_removal_tombstones
+            for actor_id, candidate_actor in candidates.items():
+                if actor_id in pending or actor_id in tombstones:
+                    continue
+                snapshot = self._diagnostic_actor_snapshot(candidate_actor)
+                location = (snapshot.get("transform") or {}).get("location")
+                sumo_info = self._collision_state_vehicle_info(actor_id)
+                record = {
+                    "event": "collision_vehicle_removal_scheduled",
+                    "warning_only": True,
+                    "actor_id": actor_id,
+                    "other_actor_id": other_role if actor_id == veh_id else veh_id,
+                    "pair_key": payload.get("pair_key", ""),
+                    "collision_frame": payload.get("carla_frame"),
+                    "simulation_time": (getattr(self, "_inproc_prev_state", None) or {}).get(
+                        "simulation_time"
+                    ),
+                    "carla_location": location,
+                    "sumo_lane_id": sumo_info.get("lane_id", ""),
+                    "sumo_position": {
+                        "x": self._as_finite_float(sumo_info.get("x")),
+                        "y": self._as_finite_float(sumo_info.get("y")),
+                    },
+                    "reason": "vehicle_collision",
+                    "remove_attempts": 0,
+                }
+                pending[actor_id] = record
+                scheduled.append(record)
+
+        for record in scheduled:
+            self._append_diagnostic_jsonl(self.collision_log_path, record)
+            location = record.get("carla_location") or {}
+            print(
+                "Warning: scheduling collided background vehicle deletion "
+                f"actor={record['actor_id']!r} other={record['other_actor_id']!r} "
+                f"frame={record['collision_frame']} lane={record['sumo_lane_id']!r} "
+                f"location=({location.get('x')}, {location.get('y')}, "
+                f"{location.get('z')})",
+                flush=True,
+            )
+
+    def _on_collision_event(self, veh_id, actor, event):  # noqa: C901
         frame = int(getattr(event, "frame", self._current_carla_frame() or -1))
         other = getattr(event, "other_actor", None)
         actor_id = int(getattr(actor, "id", -1))
@@ -1433,31 +1842,91 @@ class CarlaCosim(object):
         pair_ids = tuple(sorted((actor_id, other_id)))
         pair_key = f"{pair_ids[0]}:{pair_ids[1]}"
         frame_pair = (frame, pair_ids)
+        actor_state = (getattr(self, "_ackermann_actor_state", None) or {}).get(veh_id, {})
+        initialization_terrain_warning = bool(
+            getattr(other, "type_id", "") == "static.terrain"
+            and (
+                actor_state.get("physics_initialization_pending")
+                or actor_state.get("physics_feedback_seed_pending")
+            )
+        )
+        collision_recovery_warning = bool(
+            not initialization_terrain_warning
+            and getattr(self, "background_collision_policy", "report") == "remove"
+            and self._collision_deletable_background_actors(veh_id, actor, other)
+        )
         lock = getattr(self, "_diagnostic_lock", None) or threading.Lock()
         with lock:
             self._collision_raw_event_count += 1
-            duplicate_frame_pair = frame_pair in self._collision_seen_frame_pairs
-            if not duplicate_frame_pair:
-                self._collision_seen_frame_pairs.add(frame_pair)
-                self._collision_unique_frame_count += 1
-            previous_frame = self._collision_last_pair_frame.get(pair_ids)
-            is_new_episode = (
-                not duplicate_frame_pair
-                and (
+            if initialization_terrain_warning:
+                self._initialization_contact_warning_event_count += 1
+                duplicate_frame_pair = (
+                    frame_pair in self._initialization_contact_warning_seen_frame_pairs
+                )
+                if not duplicate_frame_pair:
+                    self._initialization_contact_warning_seen_frame_pairs.add(frame_pair)
+                previous_frame = self._initialization_contact_warning_last_pair_frame.get(pair_ids)
+                is_new_episode = not duplicate_frame_pair and (
                     previous_frame is None
                     or frame - previous_frame > self.collision_episode_gap_frames
                 )
-            )
-            if not duplicate_frame_pair:
-                self._collision_last_pair_frame[pair_ids] = frame
-            if is_new_episode:
-                self._collision_episode_count += 1
-                self._collision_episode_counts_by_pair[pair_key] = (
-                    int(self._collision_episode_counts_by_pair.get(pair_key, 0)) + 1
+                if not duplicate_frame_pair:
+                    self._initialization_contact_warning_last_pair_frame[pair_ids] = frame
+                if is_new_episode:
+                    self._initialization_contact_warning_episode_count += 1
+                    self._initialization_contact_warning_counts_by_vehicle[veh_id] = (
+                        int(self._initialization_contact_warning_counts_by_vehicle.get(veh_id, 0))
+                        + 1
+                    )
+            elif collision_recovery_warning:
+                self._collision_recovery_warning_event_count += 1
+                duplicate_frame_pair = (
+                    frame_pair in self._collision_recovery_warning_seen_frame_pairs
                 )
+                if not duplicate_frame_pair:
+                    self._collision_recovery_warning_seen_frame_pairs.add(frame_pair)
+                previous_frame = self._collision_recovery_warning_last_pair_frame.get(pair_ids)
+                is_new_episode = not duplicate_frame_pair and (
+                    previous_frame is None
+                    or frame - previous_frame > self.collision_episode_gap_frames
+                )
+                if not duplicate_frame_pair:
+                    self._collision_recovery_warning_last_pair_frame[pair_ids] = frame
+                if is_new_episode:
+                    self._collision_recovery_warning_episode_count += 1
+                    self._collision_recovery_warning_counts_by_vehicle[veh_id] = (
+                        int(self._collision_recovery_warning_counts_by_vehicle.get(veh_id, 0)) + 1
+                    )
+            else:
+                duplicate_frame_pair = frame_pair in self._collision_seen_frame_pairs
+                if not duplicate_frame_pair:
+                    self._collision_seen_frame_pairs.add(frame_pair)
+                    self._collision_unique_frame_count += 1
+                previous_frame = self._collision_last_pair_frame.get(pair_ids)
+                is_new_episode = not duplicate_frame_pair and (
+                    previous_frame is None
+                    or frame - previous_frame > self.collision_episode_gap_frames
+                )
+                if not duplicate_frame_pair:
+                    self._collision_last_pair_frame[pair_ids] = frame
+                if is_new_episode:
+                    self._collision_episode_count += 1
+                    self._collision_episode_counts_by_pair[pair_key] = (
+                        int(self._collision_episode_counts_by_pair.get(pair_key, 0)) + 1
+                    )
             episode_count = self._collision_episode_count
         payload = {
-            "event": "carla_collision",
+            "event": (
+                "carla_initialization_contact_warning"
+                if initialization_terrain_warning
+                else (
+                    "carla_collision_recovery_warning"
+                    if collision_recovery_warning
+                    else "carla_collision"
+                )
+            ),
+            "warning_only": initialization_terrain_warning or collision_recovery_warning,
+            "initialization_generation": actor_state.get("physics_initialization_generation"),
             "wall_time": time.time(),
             "carla_frame": frame,
             "carla_timestamp": self._as_finite_float(getattr(event, "timestamp", None)),
@@ -1467,13 +1936,13 @@ class CarlaCosim(object):
             "duplicate_frame_pair": duplicate_frame_pair,
             "new_episode": is_new_episode,
             "episode_count": episode_count,
-            "normal_impulse": self._diagnostic_vector(
-                getattr(event, "normal_impulse", None)
-            ),
+            "normal_impulse": self._diagnostic_vector(getattr(event, "normal_impulse", None)),
             "vehicle": self._diagnostic_actor_snapshot(actor),
-            "other_actor": self._diagnostic_actor_snapshot(other) if other is not None else None,
+            "other_actor": (self._diagnostic_actor_snapshot(other) if other is not None else None),
         }
         self._append_diagnostic_jsonl(self.collision_log_path, payload)
+        if collision_recovery_warning:
+            self._schedule_collision_vehicle_removals(veh_id, actor, other, payload)
         if not duplicate_frame_pair:
             other_role = ""
             try:
@@ -1481,8 +1950,16 @@ class CarlaCosim(object):
             except Exception:
                 pass
             print(
-                "CARLACollision "
-                f"frame={frame} vehicle={veh_id!r} other={other_role or other_id!r} "
+                (
+                    "CARLAInitializationContactWarning "
+                    if initialization_terrain_warning
+                    else (
+                        "CARLACollisionRecoveryWarning "
+                        if collision_recovery_warning
+                        else "CARLACollision "
+                    )
+                )
+                + f"frame={frame} vehicle={veh_id!r} other={other_role or other_id!r} "
                 f"new_episode={is_new_episode} pair={pair_key}",
                 flush=True,
             )
@@ -1506,6 +1983,95 @@ class CarlaCosim(object):
             if veh_id not in active:
                 self._remove_collision_sensor(veh_id)
 
+    def _build_collision_removal_commands(self):
+        if getattr(self, "background_collision_policy", "report") != "remove":
+            return []
+        lock = getattr(self, "_diagnostic_lock", None) or threading.Lock()
+        with lock:
+            pending = dict(self._pending_collision_vehicle_removals)
+            self._pending_collision_vehicle_removals.clear()
+            for actor_id, record in pending.items():
+                self._collision_vehicle_removal_tombstones.setdefault(actor_id, record)
+            tombstones = list(self._collision_vehicle_removal_tombstones.items())
+
+        commands = []
+        current_frame = self._current_carla_frame()
+        for actor_id, record in tombstones:
+            if not record.get("carla_actor_removed"):
+                actor = self._vehicle_actor_index.pop(actor_id, None)
+                self._remove_collision_sensor(actor_id)
+                self._pedestrian_actor_index.pop(actor_id, None)
+                if actor is not None:
+                    try:
+                        actor.destroy()
+                    except Exception as exc:
+                        print(
+                            "Warning: CARLA collision actor destroy failed "
+                            f"actor={actor_id!r} error={exc}",
+                            flush=True,
+                        )
+                for cache_name in (
+                    "_ackermann_actor_state",
+                    "_physics_feedback_frames",
+                    "_physics_feedback_failures",
+                    "_ackermann_feedback_state",
+                    "_ackermann_fail_closed_reasons",
+                    "_pending_background_demotions",
+                    "_physics_quarantined_vehicle_ids",
+                ):
+                    getattr(self, cache_name, {}).pop(actor_id, None)
+                self._physics_active_vehicle_ids.discard(actor_id)
+                self._actor_filter_active_vehicle_ids.discard(actor_id)
+                record["carla_actor_removed"] = True
+                record["carla_actor_removed_frame"] = current_frame
+                local_event = {
+                    **record,
+                    "event": "collision_vehicle_removed_from_carla",
+                }
+                self._append_diagnostic_jsonl(self.collision_log_path, local_event)
+
+            if record.get("last_remove_command_frame") == current_frame:
+                continue
+            record["remove_attempts"] = int(record.get("remove_attempts", 0)) + 1
+            record["last_remove_command_frame"] = current_frame
+            commands.append(
+                {
+                    "agent_id": actor_id,
+                    "agent_type": "vehicle",
+                    "command_type": "remove",
+                    "data": dict(record),
+                }
+            )
+        return commands
+
+    def _filter_collision_removal_tombstones(self, vehicles):
+        tombstones = self._collision_vehicle_removal_tombstones
+        if not tombstones:
+            return vehicles
+        filtered = dict(vehicles)
+        for actor_id, record in tuple(tombstones.items()):
+            if actor_id in vehicles:
+                filtered.pop(actor_id, None)
+                continue
+            confirmed = {
+                **record,
+                "event": "collision_vehicle_removed_from_sumo",
+                "sumo_removal_confirmed": True,
+            }
+            self._collision_vehicle_removal_history.append(confirmed)
+            tombstones.pop(actor_id, None)
+            self._append_diagnostic_jsonl(self.collision_log_path, confirmed)
+            location = record.get("carla_location") or {}
+            print(
+                "Warning: collided background vehicle deleted from CARLA and SUMO "
+                f"actor={actor_id!r} frame={record.get('collision_frame')} "
+                f"lane={record.get('sumo_lane_id')!r} "
+                f"location=({location.get('x')}, {location.get('y')}, "
+                f"{location.get('z')})",
+                flush=True,
+            )
+        return filtered
+
     def _write_collision_summary(self):
         if not getattr(self, "collision_sensor_enabled", False):
             return
@@ -1513,6 +2079,43 @@ class CarlaCosim(object):
             "raw_sensor_events": int(getattr(self, "_collision_raw_event_count", 0)),
             "unique_frame_pairs": int(getattr(self, "_collision_unique_frame_count", 0)),
             "contact_episodes": int(getattr(self, "_collision_episode_count", 0)),
+            "background_collision_policy": getattr(self, "background_collision_policy", "report"),
+            "collision_removed_vehicle_count": len(
+                getattr(self, "_collision_vehicle_removal_history", [])
+            ),
+            "collision_removed_vehicle_ids": [
+                record.get("actor_id")
+                for record in getattr(self, "_collision_vehicle_removal_history", [])
+            ],
+            "collision_removal_pending_vehicle_ids": sorted(
+                getattr(self, "_collision_vehicle_removal_tombstones", {})
+            ),
+            "initialization_terrain_warning_events": int(
+                getattr(self, "_initialization_contact_warning_event_count", 0)
+            ),
+            "initialization_terrain_warning_episodes": int(
+                getattr(self, "_initialization_contact_warning_episode_count", 0)
+            ),
+            "collision_recovery_warning_events": int(
+                getattr(self, "_collision_recovery_warning_event_count", 0)
+            ),
+            "collision_recovery_warning_episodes": int(
+                getattr(self, "_collision_recovery_warning_episode_count", 0)
+            ),
+            "collision_recovery_warnings_by_vehicle": dict(
+                sorted(
+                    (
+                        getattr(self, "_collision_recovery_warning_counts_by_vehicle", {}) or {}
+                    ).items()
+                )
+            ),
+            "initialization_terrain_warnings_by_vehicle": dict(
+                sorted(
+                    (
+                        getattr(self, "_initialization_contact_warning_counts_by_vehicle", {}) or {}
+                    ).items()
+                )
+            ),
             "episode_gap_frames": int(getattr(self, "collision_episode_gap_frames", 10)),
             "episodes_by_pair": dict(
                 sorted((getattr(self, "_collision_episode_counts_by_pair", {}) or {}).items())
@@ -1569,9 +2172,7 @@ class CarlaCosim(object):
         except Exception as exc:
             return f"state_error:{type(exc).__name__}"
 
-        z_error = abs(
-            float(actual_transform.location.z) - float(expected_transform.location.z)
-        )
+        z_error = abs(float(actual_transform.location.z) - float(expected_transform.location.z))
         horizontal_velocity = horizontal_speed(velocity)
         vertical_speed = abs(float(getattr(velocity, "z", 0.0)))
         speed_error = abs(horizontal_velocity - max(0.0, float(expected_speed or 0.0)))
@@ -1613,6 +2214,7 @@ class CarlaCosim(object):
         ):
             return False
         retry_count = int(state.get("physics_reinitialization_count", 0))
+        self._start_physics_feedback_seed(veh_id, state, "physics_initialization_restarted")
         self._set_actor_simulate_physics(actor, False)
         self._zero_ackermann_actor_motion(actor)
         state["physics_enabled"] = False
@@ -1627,9 +2229,7 @@ class CarlaCosim(object):
         state.pop("physics_last_stability_frame", None)
         state.pop("physics_ground_transform_applied_frame", None)
         state.pop("physics_ground_transform_wait_pending", None)
-        elevated_transform = self._transform_with_z_offset(
-            ground_transform, self.spawn_z_clearance
-        )
+        elevated_transform = self._transform_with_z_offset(ground_transform, self.spawn_z_clearance)
         try:
             actor.set_transform(elevated_transform)
         except Exception:
@@ -1760,8 +2360,7 @@ class CarlaCosim(object):
             extra={"stable_ticks": stable_ticks},
         )
         print(
-            f"CARLA physics initialization stable for {veh_id!r} after "
-            f"{stable_ticks} tick(s).",
+            f"CARLA physics initialization stable for {veh_id!r} after " f"{stable_ticks} tick(s).",
             flush=True,
         )
         return True
@@ -1810,9 +2409,7 @@ class CarlaCosim(object):
 
         try:
             bounding_box = actor.bounding_box
-            front_bumper_local_x = float(
-                bounding_box.location.x + bounding_box.extent.x
-            )
+            front_bumper_local_x = float(bounding_box.location.x + bounding_box.extent.x)
             if 0.1 <= front_bumper_local_x <= 10.0:
                 state["front_bumper_local_x_m"] = front_bumper_local_x
                 state["front_bumper_from_bounding_box"] = True
@@ -1837,9 +2434,7 @@ class CarlaCosim(object):
         # coordinates. Validate both interpretations and prefer the geometry
         # whose axle midpoint is closest to the actor origin.
         scale = (
-            0.01
-            if max(abs(value) for point in wheel_positions for value in point) > 20.0
-            else 1.0
+            0.01 if max(abs(value) for point in wheel_positions for value in point) > 20.0 else 1.0
         )
         scaled_positions = [(x * scale, y * scale) for x, y in wheel_positions]
 
@@ -1896,9 +2491,7 @@ class CarlaCosim(object):
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         if state.get("physics_stabilization_pending"):
-            expected_transform = initial_transform or state.get(
-                "physics_initialization_transform"
-            )
+            expected_transform = initial_transform or state.get("physics_initialization_transform")
             expected_speed = (
                 initial_speed
                 if initial_speed is not None
@@ -1914,6 +2507,12 @@ class CarlaCosim(object):
             )
 
         if not state.get("physics_enabled"):
+            if not state.get("physics_feedback_seed_pending", False):
+                self._start_physics_feedback_seed(
+                    veh_id,
+                    state,
+                    "transform_to_physics_transition",
+                )
             if state.get("physics_overlap_deferred"):
                 if initial_transform is None:
                     return False
@@ -1935,18 +2534,14 @@ class CarlaCosim(object):
                         return False
                     state["physics_overlap_blocking_actor"] = blocking_actor_id
                     actor.set_transform(
-                        self._transform_with_z_offset(
-                            initial_transform, self.spawn_z_clearance
-                        )
+                        self._transform_with_z_offset(initial_transform, self.spawn_z_clearance)
                     )
                     return False
                 state["physics_overlap_deferred"] = False
                 state.pop("physics_overlap_blocking_actor", None)
                 state["physics_ground_transform_reserved"] = True
                 actor.set_transform(initial_transform)
-                state["physics_ground_transform_applied_frame"] = (
-                    self._current_carla_frame()
-                )
+                state["physics_ground_transform_applied_frame"] = self._current_carla_frame()
                 state["physics_ground_transform_wait_pending"] = True
                 return False
 
@@ -2012,9 +2607,7 @@ class CarlaCosim(object):
                     state["physics_overlap_blocking_actor"] = blocking_actor_id
                     state["physics_ground_transform_reserved"] = False
                     actor.set_transform(
-                        self._transform_with_z_offset(
-                            pending_transform, self.spawn_z_clearance
-                        )
+                        self._transform_with_z_offset(pending_transform, self.spawn_z_clearance)
                     )
                     return False
             else:
@@ -2081,11 +2674,28 @@ class CarlaCosim(object):
 
     def _ensure_actor_teleport_mode(self, actor, veh_id):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
-        if state.get("physics_enabled") is False:
-            return
-        self._set_actor_simulate_physics(actor, False)
-        state.clear()
-        state["physics_enabled"] = False
+        transition_pending = any(
+            state.get(key)
+            for key in (
+                "physics_initialization_pending",
+                "physics_stabilization_pending",
+                "physics_overlap_deferred",
+                "physics_ground_transform_wait_pending",
+            )
+        )
+        if state.get("physics_enabled") is not False or transition_pending:
+            self._set_actor_simulate_physics(actor, False)
+            state.clear()
+            state["physics_enabled"] = False
+            self._record_actor_mode_transition(
+                veh_id,
+                "transform",
+                reason="physics_disabled_for_transform_sync",
+            )
+        self._physics_feedback_frames.pop(veh_id, None)
+        self._physics_feedback_failures.pop(veh_id, None)
+        self._ackermann_feedback_state.pop(veh_id, None)
+        self._clear_ackermann_fail_closed_reason(veh_id)
 
     def _warn_ackermann_position_error(self, veh_id, position_error):
         if self.ackermann_warn_error_m <= 0.0 or position_error < self.ackermann_warn_error_m:
@@ -2102,8 +2712,41 @@ class CarlaCosim(object):
             flush=True,
         )
 
+    def _update_canonical_target_error_warning(self, veh_id, error, veh_info):
+        """Warn once per threshold-crossing episode without changing control."""
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        finite_error = self._as_finite_float(error)
+        warning_threshold = max(
+            0.0,
+            float(getattr(self, "canonical_target_error_warn_m", 0.30)),
+        )
+        warning_active = bool(
+            warning_threshold > 0.0
+            and finite_error is not None
+            and abs(finite_error) > warning_threshold
+        )
+        was_active = bool(state.get("canonical_target_error_warning_active", False))
+        if warning_active and not was_active:
+            count = int(state.get("canonical_target_error_warning_episodes", 0)) + 1
+            state["canonical_target_error_warning_episodes"] = count
+            warning_phase = veh_info.get(
+                "external_state_maneuver_phase",
+                veh_info.get("maneuver_phase", "lane_keep"),
+            )
+            print(
+                "Warning: canonical target lateral error exceeded threshold: "
+                f"actor={veh_id} error={finite_error:.6f}m "
+                f"threshold={warning_threshold:.6f}m "
+                f"lane={veh_info.get('lane_id', '')} "
+                f"phase={warning_phase} "
+                f"episode={count}; control continues.",
+                flush=True,
+            )
+        state["canonical_target_error_warning_active"] = warning_active
+        return warning_active
+
     def _is_ackermann_feedback_apply_actor(self, veh_id):
-        return self.ackermann_feedback_apply_enabled and (
+        return bool(getattr(self, "ackermann_feedback_apply_enabled", False)) and (
             self._is_ackermann_feedback_actor(veh_id)
         )
 
@@ -2136,13 +2779,10 @@ class CarlaCosim(object):
             )
             reason = (
                 "feedback_frame_lag_exceeded"
-                if frame_lag is not None
-                and frame_lag > self.ackermann_feedback_ack_max_frame_lag
+                if frame_lag is not None and frame_lag > self.ackermann_feedback_ack_max_frame_lag
                 else "feedback_frame_mismatch"
             )
-            failures = self._register_physics_feedback_failure(
-                veh_id, reason
-            )
+            failures = self._register_physics_feedback_failure(veh_id, reason)
             state["feedback_ack_failures"] = failures
         state["feedback_frame_lag"] = (
             expected_frame - observed_frame
@@ -2154,9 +2794,7 @@ class CarlaCosim(object):
 
     def _resolve_ackermann_desired_speed(self, veh_id, veh_info):
         speed_key = (
-            "sumo_desired_speed"
-            if self._is_ackermann_feedback_apply_actor(veh_id)
-            else "speed"
+            "sumo_desired_speed" if self._is_ackermann_feedback_apply_actor(veh_id) else "speed"
         )
         desired_speed = self._as_finite_float(veh_info.get(speed_key))
         if desired_speed is None and speed_key != "speed":
@@ -2169,6 +2807,58 @@ class CarlaCosim(object):
             return emergency_decel
         return self.ackermann_tuning.max_decel
 
+    def _apply_ackermann_curve_speed_cap(
+        self,
+        veh_info,
+        current_speed,
+        speed_target,
+        desired_acceleration,
+        max_decel,
+        state,
+    ):
+        state["curve_speed_cap_pre_target_speed"] = speed_target
+        state["curve_speed_cap_curvature"] = None
+        state["curve_speed_cap_speed_limit"] = None
+        state["curve_speed_cap_active"] = False
+        state["curve_speed_cap_required_acceleration"] = None
+
+        max_lateral_accel = max(
+            0.0,
+            float(getattr(self, "ackermann_max_lateral_accel", 0.0)),
+        )
+        state["curve_speed_cap_max_lateral_acceleration"] = max_lateral_accel
+        if max_lateral_accel <= 0.0:
+            return speed_target, desired_acceleration
+
+        heading_change = self._as_finite_float(veh_info.get("lookahead_heading_change"))
+        lookahead_distance = self._as_finite_float(veh_info.get("lookahead_distance"))
+        if heading_change is None or lookahead_distance is None or lookahead_distance <= 0.0:
+            return speed_target, desired_acceleration
+
+        heading_change = abs(heading_change)
+        curvature = 2.0 * math.sin(0.5 * heading_change) / lookahead_distance
+        if curvature <= 0.0:
+            return speed_target, desired_acceleration
+
+        curve_speed_limit = math.sqrt(max_lateral_accel / curvature)
+        state["curve_speed_cap_curvature"] = curvature
+        state["curve_speed_cap_speed_limit"] = curve_speed_limit
+        state["curve_speed_cap_active"] = curve_speed_limit < speed_target
+        speed_target = min(speed_target, curve_speed_limit)
+
+        finite_current_speed = self._as_finite_float(current_speed)
+        if finite_current_speed is not None and finite_current_speed > curve_speed_limit:
+            required_acceleration = (
+                curve_speed_limit * curve_speed_limit - finite_current_speed * finite_current_speed
+            ) / (2.0 * lookahead_distance)
+            state["curve_speed_cap_required_acceleration"] = required_acceleration
+            desired_acceleration = min(
+                desired_acceleration,
+                max(-max_decel, required_acceleration),
+            )
+
+        return speed_target, desired_acceleration
+
     def _resolve_ackermann_longitudinal_target(
         self,
         veh_id,
@@ -2177,12 +2867,22 @@ class CarlaCosim(object):
         longitudinal_error=0.0,
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
+        state["longitudinal_target_mode"] = ACKERMANN_LONGITUDINAL_TARGET_MODE_ONE_STEP
+        state["curve_speed_cap_pre_target_speed"] = None
+        state["curve_speed_cap_curvature"] = None
+        state["curve_speed_cap_speed_limit"] = None
+        state["curve_speed_cap_active"] = False
+        state["curve_speed_cap_required_acceleration"] = None
+        state["curve_speed_cap_max_lateral_acceleration"] = max(
+            0.0, float(getattr(self, "ackermann_max_lateral_accel", 0.0))
+        )
         max_decel = self._resolve_ackermann_max_decel(veh_info)
         state["sumo_emergency_decel"] = max_decel
         requested_acceleration = self._as_finite_float(veh_info.get("acceleration"))
         state["sumo_requested_acceleration"] = requested_acceleration
         if not self._is_ackermann_feedback_apply_actor(veh_id):
             desired_speed = self._resolve_ackermann_desired_speed(veh_id, veh_info)
+            state["curve_speed_cap_pre_target_speed"] = desired_speed
             state["applied_desired_acceleration"] = None
             state.pop("restart_target_speed", None)
             state["restart_active"] = False
@@ -2204,7 +2904,6 @@ class CarlaCosim(object):
         state["sumo_action_invalid"] = invalid_action
         if invalid_action:
             state.pop("restart_target_speed", None)
-            state["restart_active"] = False
             state["applied_desired_acceleration"] = None
             state["longitudinal_velocity_error"] = None
             return 0.0, -max_decel
@@ -2215,11 +2914,10 @@ class CarlaCosim(object):
         )
         state["longitudinal_velocity_error"] = sumo_next_speed - current_speed
         state["applied_desired_acceleration"] = desired_acceleration
+
         speed_target = sumo_next_speed
         restart_target = self._as_finite_float(state.get("restart_target_speed"))
-        restart_active = (
-            bool(state.get("restart_active")) and restart_target is not None
-        )
+        restart_active = bool(state.get("restart_active")) and restart_target is not None
         restart_cancelled = (
             requested_acceleration <= 0.0
             or sumo_next_speed <= self.ackermann_tuning.restart_speed_epsilon
@@ -2231,8 +2929,7 @@ class CarlaCosim(object):
         else:
             restart_requested = (
                 current_speed <= self.ackermann_tuning.restart_enter_speed
-                and sumo_next_speed
-                > current_speed + self.ackermann_tuning.restart_speed_epsilon
+                and sumo_next_speed > current_speed + self.ackermann_tuning.restart_speed_epsilon
             )
             if restart_requested:
                 if restart_target is None:
@@ -2250,6 +2947,15 @@ class CarlaCosim(object):
             if restart_active and restart_target is not None:
                 speed_target = max(speed_target, restart_target)
 
+        speed_target, desired_acceleration = self._apply_ackermann_curve_speed_cap(
+            veh_info,
+            current_speed,
+            speed_target,
+            desired_acceleration,
+            max_decel,
+            state,
+        )
+        state["applied_desired_acceleration"] = desired_acceleration
         return speed_target, desired_acceleration
 
     def _current_direct_brake_steer(self, veh_id, vehicle):
@@ -2284,21 +2990,139 @@ class CarlaCosim(object):
             reverse=False,
         )
 
-    def _mark_ackermann_authoritative_fail_closed(
-        self, veh_id, veh_info, reason
-    ):
+    def _background_invalid_demotable(self, actor_id):
+        return bool(
+            actor_id != AV_SUMO_ID
+            and getattr(self, "ackermann_background_invalid_policy", "abort") == "demote"
+        )
+
+    def _record_actor_mode_transition(self, actor_id, mode, reason="", **details):
+        modes = getattr(self, "_actor_sync_modes", None)
+        if modes is None:
+            modes = {}
+            self._actor_sync_modes = modes
+        previous_mode = modes.get(actor_id)
+        if previous_mode == mode:
+            return
+        modes[actor_id] = mode
+        record = {
+            "event": "actor_mode_transition",
+            "actor_id": actor_id,
+            "previous_mode": previous_mode,
+            "mode": mode,
+            "reason": reason,
+            "carla_frame": getattr(self, "_last_world_frame", None),
+            "simulation_time": (getattr(self, "_inproc_prev_state", None) or {}).get(
+                "simulation_time"
+            ),
+            "distance_from_physics_center_m": getattr(self, "_physics_actor_distances", {}).get(
+                actor_id
+            ),
+            "actor_filter_selected": actor_id
+            in getattr(self, "_actor_filter_active_vehicle_ids", set()),
+            "physics_selected": actor_id in getattr(self, "_physics_active_vehicle_ids", set()),
+            "quarantined": actor_id in getattr(self, "_physics_quarantined_vehicle_ids", {}),
+            **details,
+        }
+        if getattr(self, "actor_mode_trace_path", ""):
+            self._append_diagnostic_jsonl(self.actor_mode_trace_path, record)
+
+    def _queue_authoritative_failure(self, actor_id, reason):
+        if self._background_invalid_demotable(actor_id):
+            self._pending_background_demotions.setdefault(
+                actor_id,
+                {
+                    "actor_id": actor_id,
+                    "reason": reason,
+                    "carla_frame": getattr(self, "_last_world_frame", None),
+                },
+            )
+            return
+        if getattr(self, "_pending_authoritative_action_error", None) is None:
+            self._pending_authoritative_action_error = {
+                "actor_id": actor_id,
+                "reason": reason,
+            }
+
+    def _apply_actor_local_fail_closed_brake(self, actor_id, reason):
+        actor = getattr(self, "_vehicle_actor_index", {}).get(actor_id)
+        if actor is None:
+            return False
+        try:
+            actor.apply_control(self._full_brake_control())
+        except Exception:
+            return False
+        print(
+            f"Physical co-sim local fail-closed brake: actor={actor_id} reason={reason}",
+            flush=True,
+        )
+        return True
+
+    def _apply_feedback_failure_brake(self, actor_id, reason):
+        if self._background_invalid_demotable(actor_id):
+            return int(self._apply_actor_local_fail_closed_brake(actor_id, reason))
+        return self._apply_physics_fail_closed_brake(reason)
+
+    def _handle_pending_background_demotions(self):
+        pending = getattr(self, "_pending_background_demotions", {})
+        if not pending:
+            return
+        active_ids = getattr(self, "_physics_active_vehicle_ids", None)
+        if active_ids is None:
+            active_ids = set()
+            self._physics_active_vehicle_ids = active_ids
+        quarantined = getattr(self, "_physics_quarantined_vehicle_ids", None)
+        if quarantined is None:
+            quarantined = {}
+            self._physics_quarantined_vehicle_ids = quarantined
+        history = getattr(self, "_background_demotion_history", None)
+        if history is None:
+            history = []
+            self._background_demotion_history = history
+        for actor_id, failure in tuple(pending.items()):
+            reason = failure["reason"]
+            self._apply_actor_local_fail_closed_brake(actor_id, reason)
+            active_ids.discard(actor_id)
+            quarantine = {
+                **failure,
+                "distance_from_physics_center_m": getattr(self, "_physics_actor_distances", {}).get(
+                    actor_id
+                ),
+            }
+            quarantined[actor_id] = quarantine
+            history.append(dict(quarantine))
+            self._physics_feedback_frames.pop(actor_id, None)
+            self._physics_feedback_failures.pop(actor_id, None)
+            self._ackermann_feedback_state.pop(actor_id, None)
+            state = self._ackermann_actor_state.setdefault(actor_id, {})
+            for key in tuple(state):
+                if (
+                    key.startswith("physics_feedback_seed_")
+                    or key.startswith("physics_control_start_")
+                    or key == "physics_initialization_generation"
+                ):
+                    state.pop(key, None)
+            state["background_demoted"] = True
+            state["background_demotion_reason"] = reason
+            self._record_actor_mode_transition(
+                actor_id,
+                "quarantined_transform",
+                reason=reason,
+            )
+            print(
+                f"Warning: Physical co-sim background actor demoted: "
+                f"actor={actor_id} reason={reason}",
+                flush=True,
+            )
+        pending.clear()
+
+    def _mark_ackermann_authoritative_fail_closed(self, veh_id, veh_info, reason):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         state["control_mode"] = "fail_closed_brake"
         state["sumo_action_invalid"] = True
-        state["sumo_emergency_decel"] = self._resolve_ackermann_max_decel(
-            veh_info
-        )
-        state["sumo_requested_acceleration"] = self._as_finite_float(
-            veh_info.get("acceleration")
-        )
-        state["sumo_desired_speed"] = self._as_finite_float(
-            veh_info.get("sumo_desired_speed")
-        )
+        state["sumo_emergency_decel"] = self._resolve_ackermann_max_decel(veh_info)
+        state["sumo_requested_acceleration"] = self._as_finite_float(veh_info.get("acceleration"))
+        state["sumo_desired_speed"] = self._as_finite_float(veh_info.get("sumo_desired_speed"))
         state["feedback_observed_speed"] = self._as_finite_float(
             veh_info.get("feedback_observed_speed")
         )
@@ -2309,11 +3133,7 @@ class CarlaCosim(object):
         state["restart_active"] = False
         state["emergency_brake_command"] = 1.0
         state["fail_closed_reason"] = reason
-        if getattr(self, "_pending_authoritative_action_error", None) is None:
-            self._pending_authoritative_action_error = {
-                "actor_id": veh_id,
-                "reason": reason,
-            }
+        self._queue_authoritative_failure(veh_id, reason)
 
     def _raise_pending_authoritative_action_error(self):
         pending = getattr(self, "_pending_authoritative_action_error", None)
@@ -2323,21 +3143,24 @@ class CarlaCosim(object):
         actor_id = pending["actor_id"]
         reason = pending["reason"]
         self._apply_ackermann_fail_closed_brake(reason)
-        raise RuntimeError(
-            f"invalid authoritative SUMO action actor={actor_id} reason={reason}"
-        )
+        raise RuntimeError(f"invalid authoritative SUMO action actor={actor_id} reason={reason}")
 
     def _should_record_ackermann_control_trace(self, veh_id):
         if not getattr(self, "ackermann_control_log_records", False):
             return False
-        control_log_actor_ids = getattr(
-            self, "ackermann_control_log_actor_ids", set()
-        )
+        control_log_actor_ids = getattr(self, "ackermann_control_log_actor_ids", set())
         return (
             not control_log_actor_ids
             or "*" in control_log_actor_ids
             or veh_id in control_log_actor_ids
         )
+
+    def _emit_ackermann_control_trace(self, trace):
+        trace_path = getattr(self, "ackermann_control_trace_path", "")
+        if trace_path:
+            self._append_diagnostic_jsonl(trace_path, trace)
+            return
+        print("AckermannControlTrace " + json.dumps(trace, sort_keys=True), flush=True)
 
     def _record_fail_closed_ackermann_control_trace(
         self,
@@ -2394,65 +3217,35 @@ class CarlaCosim(object):
                     "actor_id": veh_id,
                     "carla_frame": carla_frame,
                     "simulation_time": simulation_time,
-                    "action_source_carla_frame": veh_info.get(
-                        "feedback_source_carla_frame"
-                    ),
-                    "phase_a_requested_lane_id": veh_info.get(
-                        "feedback_requested_lane_id"
-                    ),
-                    "phase_a_observed_lane_id": veh_info.get(
-                        "feedback_observed_lane_id"
-                    ),
+                    "action_source_carla_frame": veh_info.get("feedback_source_carla_frame"),
+                    "phase_a_requested_lane_id": veh_info.get("feedback_requested_lane_id"),
+                    "phase_a_observed_lane_id": veh_info.get("feedback_observed_lane_id"),
                     "phase_b_live_lane_id": veh_info.get("lane_id"),
                     "sumo_route": veh_info.get("sumo_route", ()),
-                    "external_state_maneuver_current_lane_id": veh_info.get(
-                        "lane_id"
-                    ),
+                    "external_state_maneuver_current_lane_id": veh_info.get("lane_id"),
                     "external_state_maneuver_source_lane_id": veh_info.get(
                         "external_state_maneuver_source_lane_id", ""
                     ),
                     "external_state_maneuver_target_lane_id": veh_info.get(
                         "external_state_maneuver_target_lane_id", ""
                     ),
-                    "lookahead_action_error": veh_info.get(
-                        "lookahead_action_error", ""
-                    ),
+                    "lookahead_action_error": veh_info.get("lookahead_action_error", ""),
                     "fail_closed_reason": reason,
-                    "sumo_desired_speed": self._as_finite_float(
-                        veh_info.get("sumo_desired_speed")
-                    ),
-                    "sumo_requested_acceleration": state.get(
-                        "sumo_requested_acceleration"
-                    ),
+                    "sumo_desired_speed": self._as_finite_float(veh_info.get("sumo_desired_speed")),
+                    "sumo_requested_acceleration": state.get("sumo_requested_acceleration"),
                     "sumo_emergency_decel": state.get("sumo_emergency_decel"),
                     "restart_active": bool(state.get("restart_active")),
                     "restart_target_speed": state.get("restart_target_speed"),
-                    "longitudinal_position_error": state.get(
-                        "longitudinal_position_error"
-                    ),
-                    "longitudinal_velocity_error": state.get(
-                        "longitudinal_velocity_error"
-                    ),
+                    "longitudinal_position_error": state.get("longitudinal_position_error"),
+                    "longitudinal_velocity_error": state.get("longitudinal_velocity_error"),
                     "control_mode": "fail_closed_brake",
-                    "commanded_throttle": self._as_finite_float(
-                        getattr(control, "throttle", None)
-                    ),
-                    "commanded_brake": self._as_finite_float(
-                        getattr(control, "brake", None)
-                    ),
-                    "commanded_steer": self._as_finite_float(
-                        getattr(control, "steer", None)
-                    ),
+                    "commanded_throttle": self._as_finite_float(getattr(control, "throttle", None)),
+                    "commanded_brake": self._as_finite_float(getattr(control, "brake", None)),
+                    "commanded_steer": self._as_finite_float(getattr(control, "steer", None)),
                     "trace_degraded": True,
-                    "trace_error": (
-                        f"{type(trace_error).__name__}: {trace_error}"
-                    ),
+                    "trace_error": (f"{type(trace_error).__name__}: {trace_error}"),
                 }
-                print(
-                    "AckermannControlTrace "
-                    + json.dumps(trace, sort_keys=True, default=str),
-                    flush=True,
-                )
+                self._emit_ackermann_control_trace(trace)
             except Exception as fallback_error:
                 print(
                     "Warning: fail-closed AckermannControlTrace failed for "
@@ -2469,9 +3262,7 @@ class CarlaCosim(object):
             "ackermann_emergency_brake_tuning",
             AckermannEmergencyBrakeTuning(),
         )
-        requested_acceleration = self._as_finite_float(
-            state.get("sumo_requested_acceleration")
-        )
+        requested_acceleration = self._as_finite_float(state.get("sumo_requested_acceleration"))
         authoritative = bool(
             getattr(self, "ackermann_feedback_apply_enabled", False)
         ) and self._is_ackermann_feedback_apply_actor(veh_id)
@@ -2481,9 +3272,7 @@ class CarlaCosim(object):
         if not tuning.enabled:
             active = False
             release_ticks = 0
-        elif authoritative and (
-            requested_acceleration is None or requested_acceleration >= 0.0
-        ):
+        elif authoritative and (requested_acceleration is None or requested_acceleration >= 0.0):
             active = False
             release_ticks = 0
         elif active:
@@ -2565,9 +3354,7 @@ class CarlaCosim(object):
                 actors.append((actor_id, actor))
         for actor_id, actor in actors:
             try:
-                actor.apply_control(
-                    self._make_direct_brake_control(actor_id, actor, brake=1.0)
-                )
+                actor.apply_control(self._make_direct_brake_control(actor_id, actor, brake=1.0))
             except Exception as exc:
                 print(
                     f"Warning: fail-closed brake failed for {actor_id}: {exc}",
@@ -2594,20 +3381,13 @@ class CarlaCosim(object):
         feedback_actor = self._is_ackermann_feedback_apply_actor(veh_id)
         state.pop("fail_closed_reason", None)
         if feedback_actor:
-            state["last_action_source_carla_frame"] = veh_info.get(
-                "feedback_source_carla_frame"
-            )
+            state["last_action_source_carla_frame"] = veh_info.get("feedback_source_carla_frame")
             phase_b_sumo_angle = self._as_finite_float(sumo_angle)
             state["last_phase_b_target_sumo_angle"] = phase_b_sumo_angle
             state["last_phase_b_target_carla_yaw"] = (
-                (phase_b_sumo_angle - 90.0) % 360.0
-                if phase_b_sumo_angle is not None
-                else None
+                (phase_b_sumo_angle - 90.0) % 360.0 if phase_b_sumo_angle is not None else None
             )
-        action_pose = [
-            self._as_finite_float(value)
-            for value in (*sumo_location[:3], sumo_angle)
-        ]
+        action_pose = [self._as_finite_float(value) for value in (*sumo_location[:3], sumo_angle)]
         if feedback_actor and any(value is None for value in action_pose):
             reason = "invalid_authoritative_action_pose"
             self._mark_ackermann_authoritative_fail_closed(veh_id, veh_info, reason)
@@ -2633,12 +3413,8 @@ class CarlaCosim(object):
             "rear_axle_local_x_m",
             -0.5 * self.ackermann_tuning.wheel_base,
         )
-        current_rear_axle = self._transform_local_x_point(
-            current_transform, rear_axle_local_x
-        )
-        desired_rear_axle = self._transform_local_x_point(
-            desired_transform, rear_axle_local_x
-        )
+        current_rear_axle = self._transform_local_x_point(current_transform, rear_axle_local_x)
+        desired_rear_axle = self._transform_local_x_point(desired_transform, rear_axle_local_x)
         position_error = math.hypot(
             current_rear_axle[0] - desired_rear_axle[0],
             current_rear_axle[1] - desired_rear_axle[1],
@@ -2664,9 +3440,33 @@ class CarlaCosim(object):
             lookahead_sumo_location = self._resolve_sumo_lookahead_location(
                 veh_id, veh_info, sumo_location, sumo_angle
             )
-            lookahead_location = self._sumo_point_to_carla_location(
-                lookahead_sumo_location
+            lookahead_location = self._sumo_point_to_carla_location(lookahead_sumo_location)
+            path_tracker = (
+                self._resolve_authoritative_path_tracker(veh_info) if feedback_actor else None
             )
+            state["exact_control_target_local_x"] = None
+            state["exact_control_target_local_y"] = None
+            if feedback_actor and bool(veh_info.get("control_lookahead_position_valid", False)):
+                exact_control_sumo = [
+                    self._as_finite_float(veh_info.get("control_lookahead_x")),
+                    self._as_finite_float(veh_info.get("control_lookahead_y")),
+                    self._as_finite_float(veh_info.get("control_lookahead_z")),
+                ]
+                if exact_control_sumo[2] is None:
+                    exact_control_sumo[2] = sumo_location[2]
+                if exact_control_sumo[0] is not None and exact_control_sumo[1] is not None:
+                    exact_control_location = self._sumo_point_to_carla_location(exact_control_sumo)
+                    exact_local = world_to_vehicle_2d(
+                        current_rear_axle[0],
+                        current_rear_axle[1],
+                        current_transform.rotation.yaw,
+                        exact_control_location.x,
+                        exact_control_location.y,
+                    )
+                    state["exact_control_target_local_x"] = exact_local[0]
+                    state["exact_control_target_local_y"] = exact_local[1]
+                    if exact_local[0] <= 0.0:
+                        raise ValueError(f"rear reference target behind actor {veh_id}")
         except Exception as exc:
             if feedback_actor:
                 reason = (
@@ -2675,9 +3475,7 @@ class CarlaCosim(object):
                     or "invalid_authoritative_lookahead"
                 )
                 self._mark_ackermann_authoritative_fail_closed(veh_id, veh_info, reason)
-                control = self._make_direct_brake_control(
-                    veh_id, vehicle, brake=1.0
-                )
+                control = self._make_direct_brake_control(veh_id, vehicle, brake=1.0)
                 self._record_fail_closed_ackermann_control_trace(
                     veh_id=veh_id,
                     veh_info=veh_info,
@@ -2694,9 +3492,36 @@ class CarlaCosim(object):
 
         current_speed = horizontal_speed(current_velocity)
         desired_heading = math.radians(desired_transform.rotation.yaw)
-        longitudinal_error = self._as_finite_float(
-            veh_info.get("feedback_longitudinal_error")
+        front_bumper_local_x = state.get(
+            "front_bumper_local_x_m", 0.5 * float(veh_info.get("length", 5.0))
         )
+        lateral_position_error = self._phase_aligned_front_lateral_error(
+            current_transform,
+            desired_transform,
+            front_bumper_local_x,
+            current_velocity,
+            desired_heading,
+            self.step_length,
+        )
+        state["lateral_position_error"] = lateral_position_error
+        canonical_target_error = self._phase_aligned_front_canonical_target_error(
+            current_transform,
+            desired_transform,
+            front_bumper_local_x,
+            current_velocity,
+            veh_info.get("lookahead_target_world_left_normal_x"),
+            veh_info.get("lookahead_target_world_left_normal_y"),
+            self.step_length,
+        )
+        state["phase_aligned_canonical_target_error"] = canonical_target_error
+        state["canonical_target_error_warning_active"] = (
+            self._update_canonical_target_error_warning(
+                veh_id,
+                canonical_target_error,
+                veh_info,
+            )
+        )
+        longitudinal_error = self._as_finite_float(veh_info.get("feedback_longitudinal_error"))
         if longitudinal_error is None:
             longitudinal_error = self._phase_aligned_front_progress_error(
                 current_transform,
@@ -2709,13 +3534,11 @@ class CarlaCosim(object):
                 desired_heading,
                 self.step_length,
             )
-        desired_speed, feedback_desired_acceleration = (
-            self._resolve_ackermann_longitudinal_target(
-                veh_id,
-                veh_info,
-                current_speed,
-                longitudinal_error=longitudinal_error,
-            )
+        desired_speed, feedback_desired_acceleration = self._resolve_ackermann_longitudinal_target(
+            veh_id,
+            veh_info,
+            current_speed,
+            longitudinal_error=longitudinal_error,
         )
         values = compute_ackermann_control_values(
             current_x=current_location.x,
@@ -2735,6 +3558,13 @@ class CarlaCosim(object):
                 -0.5 * self.ackermann_tuning.wheel_base,
             ),
             wheel_base=state.get("wheel_base_m", self.ackermann_tuning.wheel_base),
+            path_curvature=(None if path_tracker is None else path_tracker["path_curvature"]),
+            path_heading_degrees=(
+                None if path_tracker is None else path_tracker["path_heading_degrees"]
+            ),
+            path_cross_track_error=(
+                None if path_tracker is None else path_tracker["path_cross_track_error"]
+            ),
         )
         final_steer = values.steer
         final_speed = values.speed
@@ -2744,15 +3574,10 @@ class CarlaCosim(object):
             else feedback_desired_acceleration
         )
         feedback = self._ackermann_feedback_state.get(veh_id, {})
-        feedback_unhealthy = (
-            feedback_actor
-            and not self._is_ackermann_feedback_healthy(
-                veh_id, feedback, veh_info.get("feedback_source_carla_frame")
-            )
+        feedback_unhealthy = feedback_actor and not self._is_ackermann_feedback_healthy(
+            veh_id, feedback, veh_info.get("feedback_source_carla_frame")
         )
-        target_behind = (
-            feedback_actor and values.lookahead_local_x <= 0.0
-        )
+        target_behind = feedback_actor and values.lookahead_local_x <= 0.0
         invalid_action = feedback_actor and bool(state.get("sumo_action_invalid"))
         fail_closed = feedback_unhealthy or target_behind or invalid_action
         fail_closed_reason = ""
@@ -2770,9 +3595,7 @@ class CarlaCosim(object):
             final_acceleration = -self._resolve_ackermann_max_decel(veh_info)
 
         if fail_closed:
-            emergency_control = self._make_direct_brake_control(
-                veh_id, vehicle, brake=1.0
-            )
+            emergency_control = self._make_direct_brake_control(veh_id, vehicle, brake=1.0)
             state["control_mode"] = "fail_closed_brake"
             state["emergency_brake_command"] = 1.0
         else:
@@ -2847,9 +3670,7 @@ class CarlaCosim(object):
         if not self._should_record_ackermann_control_trace(veh_id):
             return
 
-        feedback = getattr(self, "_ackermann_feedback_state", {}).get(
-            veh_id, {}
-        )
+        feedback = getattr(self, "_ackermann_feedback_state", {}).get(veh_id, {})
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         try:
             snapshot = self.world.get_snapshot()
@@ -2875,53 +3696,120 @@ class CarlaCosim(object):
         try:
             acceleration = vehicle.get_acceleration()
             yaw = math.radians(current_transform.rotation.yaw)
-            longitudinal_acceleration = (
-                float(acceleration.x) * math.cos(yaw)
-                + float(acceleration.y) * math.sin(yaw)
-            )
+            longitudinal_acceleration = float(acceleration.x) * math.cos(yaw) + float(
+                acceleration.y
+            ) * math.sin(yaw)
         except Exception:
             pass
 
         applied_throttle = None
         applied_brake = None
         applied_steer = None
+        applied_gear = None
         try:
             applied_control = vehicle.get_control()
-            applied_throttle = self._as_finite_float(
-                getattr(applied_control, "throttle", None)
-            )
+            applied_throttle = self._as_finite_float(getattr(applied_control, "throttle", None))
             applied_brake = self._as_finite_float(getattr(applied_control, "brake", None))
             applied_steer = self._as_finite_float(getattr(applied_control, "steer", None))
+            applied_gear = getattr(applied_control, "gear", None)
         except Exception:
             pass
 
         trace = {
             "actor_id": veh_id,
             "carla_frame": carla_frame,
-            "simulation_time": (self._inproc_prev_state or {}).get(
-                "simulation_time"
+            "actor_filter_selected": veh_id
+            in getattr(self, "_actor_filter_active_vehicle_ids", set()),
+            "physics_radius_selected": veh_id
+            in getattr(self, "_physics_active_vehicle_ids", set()),
+            "physics_distance_from_center_m": self._as_finite_float(
+                getattr(self, "_physics_actor_distances", {}).get(veh_id)
             ),
-            "action_source_carla_frame": veh_info.get(
-                "feedback_source_carla_frame"
+            "physics_sync_mode": getattr(self, "_actor_sync_modes", {}).get(veh_id, ""),
+            "physics_initialization_pending": bool(
+                state.get("physics_initialization_pending", False)
             ),
-            "phase_a_sumo_time": self._as_finite_float(
-                veh_info.get("feedback_phase_a_sumo_time")
+            "physics_initialization_generation": int(
+                state.get("physics_initialization_generation", 0)
             ),
-            "phase_a_observed_x": self._as_finite_float(
-                veh_info.get("feedback_observed_x")
+            "physics_feedback_seed_only": bool(feedback.get("physics_seed_only", False)),
+            "physics_feedback_seed_pending": bool(
+                state.get("physics_feedback_seed_pending", False)
             ),
-            "phase_a_observed_y": self._as_finite_float(
-                veh_info.get("feedback_observed_y")
+            "physics_feedback_seed_complete": bool(
+                state.get("physics_feedback_seed_complete", False)
             ),
+            "physics_feedback_seed_sent_frames": int(
+                state.get("physics_feedback_seed_sent_frames", 0)
+            ),
+            "physics_feedback_seed_acknowledged_frames": int(
+                state.get("physics_feedback_seed_acknowledged_frames", 0)
+            ),
+            "physics_feedback_seed_first_sent_frame": state.get(
+                "physics_feedback_seed_first_sent_frame"
+            ),
+            "physics_feedback_seed_start_frame": state.get("physics_feedback_seed_start_frame"),
+            "physics_feedback_seed_start_time": self._as_finite_float(
+                state.get("physics_feedback_seed_start_time")
+            ),
+            "physics_feedback_seed_first_frame": state.get("physics_feedback_seed_first_frame"),
+            "physics_feedback_seed_complete_frame": state.get(
+                "physics_feedback_seed_complete_frame"
+            ),
+            "physics_feedback_seed_complete_time": self._as_finite_float(
+                state.get("physics_feedback_seed_complete_time")
+            ),
+            "physics_feedback_seed_first_intent": state.get(
+                "physics_feedback_seed_first_intent", "none"
+            ),
+            "physics_feedback_seed_first_lane_id": state.get(
+                "physics_feedback_seed_first_lane_id", ""
+            ),
+            "physics_feedback_seed_first_canonical_d": self._as_finite_float(
+                state.get("physics_feedback_seed_first_canonical_d")
+            ),
+            "physics_feedback_seed_started_with_maneuver": bool(
+                state.get("physics_feedback_seed_started_with_maneuver", False)
+            ),
+            "physics_feedback_seed_failure_reason": state.get(
+                "physics_feedback_seed_failure_reason", ""
+            ),
+            "physics_feedback_seed_handoff_warning": state.get(
+                "physics_feedback_seed_handoff_warning", ""
+            ),
+            "physics_feedback_seed_completed_while_armed": bool(
+                state.get("physics_feedback_seed_completed_while_armed", False)
+            ),
+            "physics_control_start_frame": state.get("physics_control_start_frame"),
+            "physics_control_start_phase": state.get("physics_control_start_phase", ""),
+            "physics_control_start_target_d": self._as_finite_float(
+                state.get("physics_control_start_target_d")
+            ),
+            "physics_feedback_expected": bool(
+                getattr(self, "ackermann_feedback_apply_enabled", False)
+                and self._is_ackermann_feedback_actor(veh_id)
+                and self._uses_ackermann_physics(veh_id)
+                and not state.get("physics_initialization_pending", False)
+            ),
+            "physics_feedback_queued": feedback.get("feedback_status") == "queued",
+            "physics_quarantined": veh_id in getattr(self, "_physics_quarantined_vehicle_ids", {}),
+            "background_invalid_policy": getattr(
+                self, "ackermann_background_invalid_policy", "abort"
+            ),
+            "background_demoted": bool(state.get("background_demoted", False)),
+            "background_demotion_reason": state.get("background_demotion_reason", ""),
+            "simulation_time": (self._inproc_prev_state or {}).get("simulation_time"),
+            "action_source_carla_frame": veh_info.get("feedback_source_carla_frame"),
+            "phase_a_sumo_time": self._as_finite_float(veh_info.get("feedback_phase_a_sumo_time")),
+            "phase_a_observed_x": self._as_finite_float(veh_info.get("feedback_observed_x")),
+            "phase_a_observed_y": self._as_finite_float(veh_info.get("feedback_observed_y")),
             "phase_a_requested_sumo_angle": self._as_finite_float(
                 feedback.get("feedback_sumo_angle")
             ),
             "phase_a_observed_sumo_angle": self._as_finite_float(
                 veh_info.get("feedback_observed_sumo_angle")
             ),
-            "phase_b_target_sumo_angle": self._as_finite_float(
-                veh_info.get("sumo_angle")
-            ),
+            "phase_b_target_sumo_angle": self._as_finite_float(veh_info.get("sumo_angle")),
             "phase_b_target_carla_yaw": (
                 (float(veh_info["sumo_angle"]) - 90.0) % 360.0
                 if self._as_finite_float(veh_info.get("sumo_angle")) is not None
@@ -2932,31 +3820,78 @@ class CarlaCosim(object):
             "sumo_lane_id": veh_info.get("lane_id"),
             "phase_b_live_lane_id": veh_info.get("lane_id"),
             "sumo_route": veh_info.get("sumo_route", ()),
-            "sumo_lane_position": self._as_finite_float(
-                veh_info.get("lane_position")
-            ),
-            "sumo_lateral_offset": self._as_finite_float(
-                veh_info.get("lateral_offset")
-            ),
+            "sumo_route_index": veh_info.get("sumo_route_index"),
+            "sumo_route_distance": self._as_finite_float(veh_info.get("sumo_route_distance")),
+            "sumo_lane_position": self._as_finite_float(veh_info.get("lane_position")),
+            "sumo_lateral_offset": self._as_finite_float(veh_info.get("lateral_offset")),
             "sumo_lookahead_x": self._as_finite_float(veh_info.get("lookahead_x")),
             "sumo_lookahead_y": self._as_finite_float(veh_info.get("lookahead_y")),
+            "sumo_control_lookahead_x": self._as_finite_float(veh_info.get("control_lookahead_x")),
+            "sumo_control_lookahead_y": self._as_finite_float(veh_info.get("control_lookahead_y")),
+            "control_lookahead_position_valid": bool(
+                veh_info.get("control_lookahead_position_valid", False)
+            ),
+            "sumo_steering_preview_x": self._as_finite_float(veh_info.get("steering_preview_x")),
+            "sumo_steering_preview_y": self._as_finite_float(veh_info.get("steering_preview_y")),
+            "steering_preview_position_valid": bool(
+                veh_info.get("steering_preview_position_valid", False)
+            ),
+            "steering_preview_requested_distance": self._as_finite_float(
+                veh_info.get("steering_preview_requested_distance")
+            ),
+            "steering_preview_effective_distance": self._as_finite_float(
+                veh_info.get("steering_preview_effective_distance")
+            ),
+            "steering_preview_front_s": self._as_finite_float(
+                veh_info.get("steering_preview_front_s")
+            ),
+            "steering_preview_front_d": self._as_finite_float(
+                veh_info.get("steering_preview_front_d")
+            ),
+            "steering_preview_tangent_x": self._as_finite_float(
+                veh_info.get("steering_preview_tangent_x")
+            ),
+            "steering_preview_tangent_y": self._as_finite_float(
+                veh_info.get("steering_preview_tangent_y")
+            ),
+            "steering_preview_normal_x": self._as_finite_float(
+                veh_info.get("steering_preview_normal_x")
+            ),
+            "steering_preview_normal_y": self._as_finite_float(
+                veh_info.get("steering_preview_normal_y")
+            ),
+            "front_rear_distance_error": self._as_finite_float(
+                veh_info.get("front_rear_distance_error")
+            ),
+            "front_rear_distance_consistent": bool(
+                veh_info.get("front_rear_distance_consistent", False)
+            ),
             "sumo_route_lookahead_x": self._as_finite_float(veh_info.get("lookahead_route_x")),
             "sumo_route_lookahead_y": self._as_finite_float(veh_info.get("lookahead_route_y")),
             "lookahead_action_mode": veh_info.get("lookahead_action_mode"),
             "lookahead_action_valid": bool(veh_info.get("lookahead_action_valid", True)),
             "lookahead_action_error": veh_info.get("lookahead_action_error", ""),
-            "lookahead_action_warning": veh_info.get(
-                "lookahead_action_warning", ""
-            ),
+            "lookahead_action_warning": veh_info.get("lookahead_action_warning", ""),
             "lookahead_lateral_direction_source": veh_info.get(
                 "lookahead_lateral_direction_source", "inactive"
             ),
             "lookahead_lateral_direction_unresolved_count": int(
-                veh_info.get("lookahead_lateral_direction_unresolved_count", 0)
-                or 0
+                veh_info.get("lookahead_lateral_direction_unresolved_count", 0) or 0
             ),
             "lookahead_lane_change_intent_conflict": bool(
                 veh_info.get("lookahead_lane_change_intent_conflict", False)
+            ),
+            "external_state_lateral_maneuver_enabled": bool(
+                veh_info.get("external_state_lateral_maneuver_enabled", False)
+            ),
+            "external_state_lateral_maneuver_target_enabled": bool(
+                veh_info.get("external_state_lateral_maneuver_target_enabled", False)
+            ),
+            "external_state_internal_lane_transition_assist_enabled": bool(
+                veh_info.get("external_state_internal_lane_transition_assist_enabled", False)
+            ),
+            "feedback_internal_lane_transition_assist_applied": bool(
+                veh_info.get("feedback_internal_lane_transition_assist_applied", False)
             ),
             "external_state_maneuver_current_lane_id": veh_info.get("lane_id"),
             "external_state_maneuver_source_lane_id": veh_info.get(
@@ -2965,15 +3900,288 @@ class CarlaCosim(object):
             "external_state_maneuver_target_lane_id": veh_info.get(
                 "external_state_maneuver_target_lane_id", ""
             ),
-            "fail_closed_reason": (
-                fail_closed_reason or state.get("fail_closed_reason", "")
+            "external_state_maneuver_phase": veh_info.get(
+                "external_state_maneuver_phase", "lane_keep"
             ),
+            "external_state_maneuver_armed_origin_phase": veh_info.get(
+                "external_state_maneuver_armed_origin_phase", "lane_keep"
+            ),
+            "external_state_maneuver_target_pre_state_phase": veh_info.get(
+                "external_state_maneuver_target_pre_state_phase", "lane_keep"
+            ),
+            "external_state_maneuver_target_post_state_phase": veh_info.get(
+                "external_state_maneuver_target_post_state_phase", "lane_keep"
+            ),
+            "external_state_maneuver_target_applied": bool(
+                veh_info.get("external_state_maneuver_target_applied", False)
+            ),
+            "external_state_maneuver_target_source": veh_info.get(
+                "external_state_maneuver_target_source", "route_center"
+            ),
+            "external_state_maneuver_target_selected_d": self._as_finite_float(
+                veh_info.get("external_state_maneuver_target_selected_d")
+            ),
+            "external_state_maneuver_target_world_anchor_x": self._as_finite_float(
+                veh_info.get("external_state_maneuver_target_world_anchor_x")
+            ),
+            "external_state_maneuver_target_world_anchor_y": self._as_finite_float(
+                veh_info.get("external_state_maneuver_target_world_anchor_y")
+            ),
+            "external_state_maneuver_target_d_outside_lane": veh_info.get(
+                "external_state_maneuver_target_d_outside_lane"
+            ),
+            "external_state_maneuver_target_d_outside_primary_lane": veh_info.get(
+                "external_state_maneuver_target_d_outside_primary_lane"
+            ),
+            "external_state_maneuver_target_safety_region": veh_info.get(
+                "external_state_maneuver_target_safety_region", "primary_lane"
+            ),
+            "external_state_active_maneuver_corridor_valid": veh_info.get(
+                "external_state_active_maneuver_corridor_valid"
+            ),
+            "external_state_active_maneuver_corridor_reason": veh_info.get(
+                "external_state_active_maneuver_corridor_reason", ""
+            ),
+            "external_state_active_maneuver_corridor_d_min": self._as_finite_float(
+                veh_info.get("external_state_active_maneuver_corridor_d_min")
+            ),
+            "external_state_active_maneuver_corridor_d_max": self._as_finite_float(
+                veh_info.get("external_state_active_maneuver_corridor_d_max")
+            ),
+            "external_state_active_maneuver_corridor_source_center_d": self._as_finite_float(
+                veh_info.get("external_state_active_maneuver_corridor_source_center_d")
+            ),
+            "external_state_active_maneuver_corridor_target_center_d": self._as_finite_float(
+                veh_info.get("external_state_active_maneuver_corridor_target_center_d")
+            ),
+            "external_state_active_maneuver_corridor_center_separation": self._as_finite_float(
+                veh_info.get("external_state_active_maneuver_corridor_center_separation")
+            ),
+            "external_state_maneuver_primary_lane_switched": bool(
+                veh_info.get("external_state_maneuver_primary_lane_switched", False)
+            ),
+            "external_state_maneuver_current_lateral_offset": self._as_finite_float(
+                veh_info.get("external_state_maneuver_current_lateral_offset")
+            ),
+            "external_state_maneuver_preview_lateral_offset": self._as_finite_float(
+                veh_info.get("external_state_maneuver_preview_lateral_offset")
+            ),
+            "external_state_maneuver_held_lateral_offset": self._as_finite_float(
+                veh_info.get("external_state_maneuver_held_lateral_offset")
+            ),
+            "external_state_maneuver_active_frame_count": int(
+                veh_info.get("external_state_maneuver_active_frame_count", 0) or 0
+            ),
+            "external_state_maneuver_zero_motion_frame_count": int(
+                veh_info.get("external_state_maneuver_zero_motion_frame_count", 0) or 0
+            ),
+            "external_state_maneuver_transition_reason": veh_info.get(
+                "external_state_maneuver_transition_reason", ""
+            ),
+            "external_state_maneuver_evidence_eligible": bool(
+                veh_info.get("external_state_maneuver_evidence_eligible", False)
+            ),
+            "external_state_maneuver_evidence_exclusion_reason": veh_info.get(
+                "external_state_maneuver_evidence_exclusion_reason", ""
+            ),
+            "external_state_maneuver_canonical_motion_evidence": bool(
+                veh_info.get("external_state_maneuver_canonical_motion_evidence", False)
+            ),
+            "external_state_maneuver_canonical_delta_sign": int(
+                veh_info.get("external_state_maneuver_canonical_delta_sign", 0) or 0
+            ),
+            "external_state_maneuver_speed_motion_evidence": bool(
+                veh_info.get("external_state_maneuver_speed_motion_evidence", False)
+            ),
+            "external_state_maneuver_intent_evidence": bool(
+                veh_info.get("external_state_maneuver_intent_evidence", False)
+            ),
+            "external_state_maneuver_authorized": bool(
+                veh_info.get("external_state_maneuver_authorized", False)
+            ),
+            "external_state_maneuver_authorization_source": veh_info.get(
+                "external_state_maneuver_authorization_source", "none"
+            ),
+            "external_state_maneuver_authorized_direction": veh_info.get(
+                "external_state_maneuver_authorized_direction", "none"
+            ),
+            "external_state_maneuver_start_candidate_sign": int(
+                veh_info.get("external_state_maneuver_start_candidate_sign", 0) or 0
+            ),
+            "external_state_maneuver_start_candidate_frame_count": int(
+                veh_info.get("external_state_maneuver_start_candidate_frame_count", 0) or 0
+            ),
+            "external_state_maneuver_armed_idle_frame_count": int(
+                veh_info.get("external_state_maneuver_armed_idle_frame_count", 0) or 0
+            ),
+            "external_state_maneuver_confirmed_direction_sign": int(
+                veh_info.get("external_state_maneuver_confirmed_direction_sign", 0) or 0
+            ),
+            "external_state_maneuver_confirmed_sumo_time": self._as_finite_float(
+                veh_info.get("external_state_maneuver_confirmed_sumo_time")
+            ),
+            "external_state_maneuver_confirmed_direction_x": self._as_finite_float(
+                veh_info.get("external_state_maneuver_confirmed_direction_x")
+            ),
+            "external_state_maneuver_confirmed_direction_y": self._as_finite_float(
+                veh_info.get("external_state_maneuver_confirmed_direction_y")
+            ),
+            "external_state_maneuver_switch_evidence_excluded": bool(
+                veh_info.get("external_state_maneuver_switch_evidence_excluded", False)
+            ),
+            "fail_closed_reason": (fail_closed_reason or state.get("fail_closed_reason", "")),
             "lookahead_lateral_horizon_displacement": self._as_finite_float(
                 veh_info.get("lookahead_lateral_horizon_displacement")
             ),
             "lookahead_target_lateral_distance": self._as_finite_float(
                 veh_info.get("lookahead_target_lateral_distance")
             ),
+            "canonical_route_lane_ids": veh_info.get("canonical_route_lane_ids", ()),
+            "canonical_actual_lane_id": veh_info.get("canonical_actual_lane_id", ""),
+            "canonical_reference_lane_id": veh_info.get("canonical_reference_lane_id", ""),
+            "canonical_route_successor_edge_id": veh_info.get(
+                "canonical_route_successor_edge_id", ""
+            ),
+            "canonical_route_selection_reason": veh_info.get(
+                "canonical_route_selection_reason", ""
+            ),
+            "canonical_route_selection_error": veh_info.get("canonical_route_selection_error", ""),
+            "canonical_planned_link_selectors": veh_info.get(
+                "canonical_planned_link_selectors", ()
+            ),
+            "canonical_route_path_key": veh_info.get("canonical_route_path_key", ()),
+            "canonical_route_occurrence_ids": veh_info.get("canonical_route_occurrence_ids", ()),
+            "canonical_rolling_history_lane_ids": veh_info.get(
+                "canonical_rolling_history_lane_ids", ()
+            ),
+            "canonical_rolling_history_distance": self._as_finite_float(
+                veh_info.get("canonical_rolling_history_distance")
+            ),
+            "canonical_rolling_retained_history_distance": self._as_finite_float(
+                veh_info.get("canonical_rolling_retained_history_distance")
+            ),
+            "canonical_route_path_switched": bool(
+                veh_info.get("canonical_route_path_switched", False)
+            ),
+            "canonical_phase_a_s": self._as_finite_float(veh_info.get("canonical_phase_a_s")),
+            "canonical_phase_a_d": self._as_finite_float(veh_info.get("canonical_phase_a_d")),
+            "canonical_evidence_phase_a_s": self._as_finite_float(
+                veh_info.get("canonical_evidence_phase_a_s")
+            ),
+            "canonical_evidence_phase_a_d": self._as_finite_float(
+                veh_info.get("canonical_evidence_phase_a_d")
+            ),
+            "canonical_phase_a_projection_distance": self._as_finite_float(
+                veh_info.get("canonical_phase_a_projection_distance")
+            ),
+            "canonical_phase_a_projection_along_residual": self._as_finite_float(
+                veh_info.get("canonical_phase_a_projection_along_residual")
+            ),
+            "canonical_phase_a_projection_endpoint_clamped": bool(
+                veh_info.get("canonical_phase_a_projection_endpoint_clamped", False)
+            ),
+            "canonical_phase_b_s": self._as_finite_float(veh_info.get("canonical_phase_b_s")),
+            "canonical_phase_b_d": self._as_finite_float(veh_info.get("canonical_phase_b_d")),
+            "canonical_phase_b_projection_distance": self._as_finite_float(
+                veh_info.get("canonical_phase_b_projection_distance")
+            ),
+            "canonical_phase_b_projection_along_residual": self._as_finite_float(
+                veh_info.get("canonical_phase_b_projection_along_residual")
+            ),
+            "canonical_phase_b_projection_endpoint_clamped": bool(
+                veh_info.get("canonical_phase_b_projection_endpoint_clamped", False)
+            ),
+            "canonical_delta_d": self._as_finite_float(veh_info.get("canonical_delta_d")),
+            "phase_a_to_b_delta_x": self._as_finite_float(veh_info.get("phase_a_to_b_delta_x")),
+            "phase_a_to_b_delta_y": self._as_finite_float(veh_info.get("phase_a_to_b_delta_y")),
+            "phase_a_to_b_velocity_x": self._as_finite_float(
+                veh_info.get("phase_a_to_b_velocity_x")
+            ),
+            "phase_a_to_b_velocity_y": self._as_finite_float(
+                veh_info.get("phase_a_to_b_velocity_y")
+            ),
+            "phase_a_to_b_requested_longitudinal_speed": self._as_finite_float(
+                veh_info.get("phase_a_to_b_requested_longitudinal_speed")
+            ),
+            "phase_a_to_b_requested_lateral_speed": self._as_finite_float(
+                veh_info.get("phase_a_to_b_requested_lateral_speed")
+            ),
+            "phase_a_to_b_motion_heading_radians": self._as_finite_float(
+                veh_info.get("phase_a_to_b_motion_heading_radians")
+            ),
+            "phase_a_to_b_motion_heading_degrees": self._as_finite_float(
+                veh_info.get("phase_a_to_b_motion_heading_degrees")
+            ),
+            "phase_a_to_b_motion_heading_valid": bool(
+                veh_info.get("phase_a_to_b_motion_heading_valid", False)
+            ),
+            "phase_a_to_b_motion_heading_invalid_reason": veh_info.get(
+                "phase_a_to_b_motion_heading_invalid_reason", ""
+            ),
+            "phase_a_to_b_lateral_motion_requested": bool(
+                veh_info.get("phase_a_to_b_lateral_motion_requested", False)
+            ),
+            "canonical_target_s": self._as_finite_float(veh_info.get("canonical_target_s")),
+            "canonical_target_d": self._as_finite_float(veh_info.get("canonical_target_d")),
+            "canonical_curvature_half_window": self._as_finite_float(
+                veh_info.get("canonical_curvature_half_window")
+            ),
+            "path_tracker_valid": bool(veh_info.get("path_tracker_valid", False)),
+            "path_tracker_center_curvature": self._as_finite_float(
+                veh_info.get("path_tracker_center_curvature")
+            ),
+            "path_tracker_front_curvature": self._as_finite_float(
+                veh_info.get("path_tracker_front_curvature")
+            ),
+            "path_tracker_rear_curvature": self._as_finite_float(
+                veh_info.get("path_tracker_rear_curvature")
+            ),
+            "path_tracker_reference_tangent_x": self._as_finite_float(
+                veh_info.get("path_tracker_reference_tangent_x")
+            ),
+            "path_tracker_reference_tangent_y": self._as_finite_float(
+                veh_info.get("path_tracker_reference_tangent_y")
+            ),
+            "path_tracker_front_cross_track_error": self._as_finite_float(
+                veh_info.get("path_tracker_front_cross_track_error")
+            ),
+            "path_tracker_motion_heading_applied": bool(
+                veh_info.get("path_tracker_motion_heading_applied", False)
+            ),
+            "path_tracker_reference_heading_source": veh_info.get(
+                "path_tracker_reference_heading_source", "route_tangent"
+            ),
+            "path_tracker_motion_heading_reason": veh_info.get(
+                "path_tracker_motion_heading_reason", ""
+            ),
+            "canonical_held_d": self._as_finite_float(veh_info.get("canonical_held_d")),
+            "canonical_hold_reprojected": bool(veh_info.get("canonical_hold_reprojected", False)),
+            "canonical_invariant_valid": bool(veh_info.get("canonical_invariant_valid", False)),
+            "canonical_invariant_reason": veh_info.get("canonical_invariant_reason", ""),
+            "canonical_invariant_warning": veh_info.get("canonical_invariant_warning", ""),
+            "canonical_fallback_applied": bool(veh_info.get("canonical_fallback_applied", False)),
+            "canonical_fallback_reason": veh_info.get("canonical_fallback_reason", ""),
+            "canonical_fallback_age": int(veh_info.get("canonical_fallback_age", 0) or 0),
+            "canonical_front_target_lateral_jump": self._as_finite_float(
+                veh_info.get("canonical_front_target_lateral_jump")
+            ),
+            "canonical_control_target_lateral_jump": self._as_finite_float(
+                veh_info.get("canonical_control_target_lateral_jump")
+            ),
+            "canonical_steering_preview_lateral_jump": self._as_finite_float(
+                veh_info.get("canonical_steering_preview_lateral_jump")
+            ),
+            "canonical_front_target_lateral_change": self._as_finite_float(
+                veh_info.get("canonical_front_target_lateral_change")
+            ),
+            "canonical_control_target_lateral_change": self._as_finite_float(
+                veh_info.get("canonical_control_target_lateral_change")
+            ),
+            "canonical_steering_preview_lateral_change": self._as_finite_float(
+                veh_info.get("canonical_steering_preview_lateral_change")
+            ),
+            "canonical_current_d_outside_lane": veh_info.get("canonical_current_d_outside_lane"),
+            "canonical_held_d_outside_lane": veh_info.get("canonical_held_d_outside_lane"),
             "lookahead_route_tangent_x": self._as_finite_float(
                 veh_info.get("lookahead_route_tangent_x")
             ),
@@ -2986,6 +4194,12 @@ class CarlaCosim(object):
             "lookahead_world_left_normal_y": self._as_finite_float(
                 veh_info.get("lookahead_world_left_normal_y")
             ),
+            "lookahead_target_world_left_normal_x": self._as_finite_float(
+                veh_info.get("lookahead_target_world_left_normal_x")
+            ),
+            "lookahead_target_world_left_normal_y": self._as_finite_float(
+                veh_info.get("lookahead_target_world_left_normal_y")
+            ),
             "phase_b_lateral_delta": self._as_finite_float(
                 veh_info.get("lookahead_phase_b_lateral_delta")
             ),
@@ -2995,50 +4209,101 @@ class CarlaCosim(object):
             "world_lateral_speed": self._as_finite_float(
                 veh_info.get("lookahead_world_lateral_speed")
             ),
-            "lookahead_origin_x": self._as_finite_float(
-                veh_info.get("lookahead_origin_x")
-            ),
-            "lookahead_origin_y": self._as_finite_float(
-                veh_info.get("lookahead_origin_y")
+            "lookahead_origin_x": self._as_finite_float(veh_info.get("lookahead_origin_x")),
+            "lookahead_origin_y": self._as_finite_float(veh_info.get("lookahead_origin_y")),
+            "feedback_rear_axle_x": self._as_finite_float(veh_info.get("feedback_rear_axle_x")),
+            "feedback_rear_axle_y": self._as_finite_float(veh_info.get("feedback_rear_axle_y")),
+            "front_to_rear_axle_distance": self._as_finite_float(
+                veh_info.get("front_to_rear_axle_distance")
             ),
             "carla_x": self._as_finite_float(current_transform.location.x),
             "carla_y": self._as_finite_float(current_transform.location.y),
             "carla_yaw": self._as_finite_float(current_transform.rotation.yaw),
+            "carla_pitch": self._as_finite_float(
+                getattr(current_transform.rotation, "pitch", None)
+            ),
             "phase_a_observed_acceleration": self._as_finite_float(
                 veh_info.get("feedback_observed_acceleration")
             ),
-            "phase_a_requested_lane_id": veh_info.get(
-                "feedback_requested_lane_id"
-            ),
+            "phase_a_requested_lane_id": veh_info.get("feedback_requested_lane_id"),
             "phase_a_observed_lane_id": veh_info.get("feedback_observed_lane_id"),
-            "sumo_lane_change_intent": veh_info.get(
-                "sumo_lane_change_intent", "none"
+            "sumo_lane_change_intent": veh_info.get("sumo_lane_change_intent", "none"),
+            "sumo_lane_change_target_lane_id": veh_info.get("sumo_lane_change_target_lane_id", ""),
+            "av_control_mode": veh_info.get("av_control_mode", "external"),
+            "av_lane_change_decision": veh_info.get("av_lane_change_decision", {}),
+            "av_lane_change_request": veh_info.get("av_lane_change_request", {}),
+            "effective_speed_mode": veh_info.get("effective_speed_mode"),
+            "nde_lane_change_decision_source": veh_info.get("nde_lane_change_decision_source", ""),
+            "nde_lane_change_command": veh_info.get("nde_lane_change_command", "none"),
+            "nde_lane_change_request_count": int(
+                veh_info.get("nde_lane_change_request_count", 0) or 0
             ),
-            "sumo_lane_change_target_lane_id": veh_info.get(
-                "sumo_lane_change_target_lane_id", ""
+            "nde_lane_change_request_time": self._as_finite_float(
+                veh_info.get("nde_lane_change_request_time")
             ),
+            "nde_lane_change_source_lane_id": veh_info.get("nde_lane_change_source_lane_id", ""),
+            "nde_lane_change_target_lane_id": veh_info.get("nde_lane_change_target_lane_id", ""),
+            "nde_lane_change_duration": self._as_finite_float(
+                veh_info.get("nde_lane_change_duration")
+            ),
+            "nde_lane_change_model_state": veh_info.get("nde_lane_change_model_state"),
+            "nde_lane_change_post_state": veh_info.get("nde_lane_change_post_state"),
+            "nde_controller_busy": bool(veh_info.get("nde_controller_busy", False)),
+            "nde_command_end_reason": veh_info.get("nde_command_end_reason", ""),
+            "effective_lane_change_mode": veh_info.get("effective_lane_change_mode"),
             "sumo_desired_speed": self._as_finite_float(veh_info.get("sumo_desired_speed")),
+            "sumo_leader_id": veh_info.get("sumo_leader_id", ""),
+            "sumo_leader_gap": self._as_finite_float(veh_info.get("sumo_leader_gap")),
+            "sumo_leader_speed": self._as_finite_float(veh_info.get("sumo_leader_speed")),
+            "sumo_leader_acceleration": self._as_finite_float(
+                veh_info.get("sumo_leader_acceleration")
+            ),
+            "sumo_leader_lane_id": veh_info.get("sumo_leader_lane_id", ""),
+            "sumo_leader_lane_position": self._as_finite_float(
+                veh_info.get("sumo_leader_lane_position")
+            ),
             "sumo_reported_acceleration": self._as_finite_float(veh_info.get("acceleration")),
-            "feedback_observed_speed": self._as_finite_float(veh_info.get("feedback_observed_speed")),
+            "feedback_observed_speed": self._as_finite_float(
+                veh_info.get("feedback_observed_speed")
+            ),
             "sumo_requested_acceleration": state.get("sumo_requested_acceleration"),
+            "ackermann_longitudinal_target_mode": state.get(
+                "longitudinal_target_mode",
+                ACKERMANN_LONGITUDINAL_TARGET_MODE_ONE_STEP,
+            ),
             "sumo_emergency_decel": state.get("sumo_emergency_decel"),
             "restart_active": bool(state.get("restart_active")),
             "restart_target_speed": state.get("restart_target_speed"),
-            "longitudinal_position_error": state.get(
-                "longitudinal_position_error"
+            "curve_speed_cap_max_lateral_acceleration": state.get(
+                "curve_speed_cap_max_lateral_acceleration"
             ),
-            "longitudinal_velocity_error": state.get(
-                "longitudinal_velocity_error"
+            "curve_speed_cap_pre_target_speed": state.get("curve_speed_cap_pre_target_speed"),
+            "curve_speed_cap_curvature": state.get("curve_speed_cap_curvature"),
+            "curve_speed_cap_speed_limit": state.get("curve_speed_cap_speed_limit"),
+            "curve_speed_cap_active": bool(state.get("curve_speed_cap_active")),
+            "curve_speed_cap_required_acceleration": state.get(
+                "curve_speed_cap_required_acceleration"
             ),
+            "longitudinal_position_error": state.get("longitudinal_position_error"),
+            "phase_aligned_lateral_position_error": state.get("lateral_position_error"),
+            "phase_aligned_canonical_target_error": state.get(
+                "phase_aligned_canonical_target_error"
+            ),
+            "canonical_target_error_warning_threshold": float(
+                getattr(self, "canonical_target_error_warn_m", 0.30)
+            ),
+            "canonical_target_error_warning_active": bool(
+                state.get("canonical_target_error_warning_active", False)
+            ),
+            "canonical_target_error_warning_episodes": int(
+                state.get("canonical_target_error_warning_episodes", 0)
+            ),
+            "longitudinal_velocity_error": state.get("longitudinal_velocity_error"),
             "ackermann_target_speed": target_speed,
             "ackermann_target_acceleration": target_acceleration,
             "control_mode": control_mode,
-            "emergency_brake_active": bool(
-                state.get("emergency_brake_active", False)
-            ),
-            "emergency_brake_release_ticks": int(
-                state.get("emergency_brake_release_ticks", 0)
-            ),
+            "emergency_brake_active": bool(state.get("emergency_brake_active", False)),
+            "emergency_brake_release_ticks": int(state.get("emergency_brake_release_ticks", 0)),
             "commanded_throttle": self._as_finite_float(commanded_throttle),
             "commanded_brake": self._as_finite_float(commanded_brake),
             "commanded_steer": self._as_finite_float(commanded_steer),
@@ -3048,29 +4313,36 @@ class CarlaCosim(object):
             "carla_applied_throttle": applied_throttle,
             "carla_applied_brake": applied_brake,
             "carla_applied_steer": applied_steer,
+            "carla_applied_gear": applied_gear,
             "position_error": position_error,
-            "lookahead_distance": self._as_finite_float(
-                veh_info.get("lookahead_distance")
-            ),
+            "lookahead_distance": self._as_finite_float(veh_info.get("lookahead_distance")),
             "lookahead_heading_change": self._as_finite_float(
                 veh_info.get("lookahead_heading_change")
             ),
             "lookahead_lane_change_blend": self._as_finite_float(
                 veh_info.get("lookahead_lane_change_blend")
             ),
-            "sumo_lateral_speed": self._as_finite_float(
-                veh_info.get("lateral_speed")
-            ),
+            "sumo_lateral_speed": self._as_finite_float(veh_info.get("lateral_speed")),
             "feedback_position_skipped_for_lane_change": bool(
                 veh_info.get("feedback_position_skipped_for_lane_change", False)
             ),
+            "feedback_lateral_reference_preserved": bool(
+                veh_info.get("feedback_lateral_reference_preserved", False)
+            ),
+            "feedback_preserved_sumo_lateral_offset": self._as_finite_float(
+                veh_info.get("feedback_preserved_sumo_lateral_offset")
+            ),
+            "feedback_assimilated_x": self._as_finite_float(veh_info.get("feedback_assimilated_x")),
+            "feedback_assimilated_y": self._as_finite_float(veh_info.get("feedback_assimilated_y")),
+            "feedback_requested_sumo_angle": self._as_finite_float(
+                veh_info.get("feedback_requested_sumo_angle")
+            ),
+            "feedback_observed_sumo_angle": self._as_finite_float(
+                veh_info.get("feedback_observed_sumo_angle")
+            ),
             "wheel_base_m": self._as_finite_float(state.get("wheel_base_m")),
-            "rear_axle_local_x_m": self._as_finite_float(
-                state.get("rear_axle_local_x_m")
-            ),
-            "front_bumper_local_x_m": self._as_finite_float(
-                state.get("front_bumper_local_x_m")
-            ),
+            "rear_axle_local_x_m": self._as_finite_float(state.get("rear_axle_local_x_m")),
+            "front_bumper_local_x_m": self._as_finite_float(state.get("front_bumper_local_x_m")),
             "front_bumper_from_bounding_box": bool(
                 state.get("front_bumper_from_bounding_box", False)
             ),
@@ -3084,11 +4356,51 @@ class CarlaCosim(object):
             "pure_pursuit_command_steer": self._as_finite_float(
                 getattr(control_values, "steer", None)
             ),
+            "lateral_control_mode": getattr(control_values, "lateral_control_mode", None),
+            "lateral_control_raw_steer": self._as_finite_float(
+                getattr(control_values, "raw_steer", None)
+            ),
+            "lateral_control_clamped_steer": self._as_finite_float(
+                getattr(control_values, "clamped_steer", None)
+            ),
+            "lateral_control_command_steer": self._as_finite_float(
+                getattr(control_values, "steer", None)
+            ),
+            "path_tracker_command_curvature": self._as_finite_float(
+                getattr(control_values, "path_curvature", None)
+            ),
+            "path_tracker_heading_error": self._as_finite_float(
+                getattr(control_values, "path_heading_error", None)
+            ),
+            "path_tracker_command_cross_track_error": self._as_finite_float(
+                getattr(control_values, "path_cross_track_error", None)
+            ),
+            "path_tracker_feedforward_steer": self._as_finite_float(
+                getattr(control_values, "path_feedforward_steer", None)
+            ),
+            "path_tracker_heading_feedback_steer": self._as_finite_float(
+                getattr(control_values, "path_heading_feedback_steer", None)
+            ),
+            "path_tracker_cross_track_feedback_steer": self._as_finite_float(
+                getattr(control_values, "path_cross_track_feedback_steer", None)
+            ),
+            "path_tracker_cross_track_feedback_unblended_steer": self._as_finite_float(
+                getattr(control_values, "path_cross_track_feedback_unblended_steer", None)
+            ),
+            "path_tracker_cross_track_low_speed_blend": self._as_finite_float(
+                getattr(control_values, "path_cross_track_low_speed_blend", None)
+            ),
             "lookahead_local_x": self._as_finite_float(
                 getattr(control_values, "lookahead_local_x", None)
             ),
             "lookahead_local_y": self._as_finite_float(
                 getattr(control_values, "lookahead_local_y", None)
+            ),
+            "exact_control_target_local_x": self._as_finite_float(
+                state.get("exact_control_target_local_x")
+            ),
+            "exact_control_target_local_y": self._as_finite_float(
+                state.get("exact_control_target_local_y")
             ),
             "control_point_x": self._as_finite_float(
                 getattr(control_values, "control_point_x", None)
@@ -3099,7 +4411,7 @@ class CarlaCosim(object):
             "feedback_unhealthy": feedback_unhealthy,
             "target_behind": target_behind,
         }
-        print("AckermannControlTrace " + json.dumps(trace, sort_keys=True), flush=True)
+        self._emit_ackermann_control_trace(trace)
 
     def tick(self):
         """One co-sim step. Dispatches on the tick mode.
@@ -3194,6 +4506,7 @@ class CarlaCosim(object):
             av_command = self._build_av_command()
             if av_command is not None:
                 commands.append(av_command)
+        commands.extend(self._build_collision_removal_commands())
         commands.extend(self._build_physics_feedback_commands())
 
         try:
@@ -3311,8 +4624,12 @@ class CarlaCosim(object):
         self._async_write_ms.append((done - w0) * 1000.0)
         self._async_work_ms.append((done - t0) * 1000.0)
         nveh = len(self._vehicle_actor_index)
-        self._async_veh_min = nveh if self._async_veh_min is None else min(self._async_veh_min, nveh)
-        self._async_veh_max = nveh if self._async_veh_max is None else max(self._async_veh_max, nveh)
+        self._async_veh_min = (
+            nveh if self._async_veh_min is None else min(self._async_veh_min, nveh)
+        )
+        self._async_veh_max = (
+            nveh if self._async_veh_max is None else max(self._async_veh_max, nveh)
+        )
         state = self._inproc_prev_state
         if isinstance(state, dict):
             sveh = len(state.get("agent_details", {}).get("vehicle", {}))
@@ -3465,7 +4782,10 @@ class CarlaCosim(object):
                 return None
             AV = self.world.get_actor(carla_id)
             if AV is None:
-                print(f"AV actor {carla_id} not resolvable this loop; command skipped.", flush=True)
+                print(
+                    f"AV actor {carla_id} not resolvable this loop; command skipped.",
+                    flush=True,
+                )
                 return None
             self._av_actor = AV
             transform = AV.get_transform()
@@ -3499,14 +4819,15 @@ class CarlaCosim(object):
             sumo_x += math.cos(yaw) * self.av_shape[0] / 2.0
             sumo_y += math.sin(yaw) * self.av_shape[0] / 2.0
             av_sumo_location = [sumo_x, sumo_y, transform.location.z]
-            av_sumo_rotation = [transform.rotation.pitch, transform.rotation.yaw + 90, transform.rotation.roll]
+            av_sumo_rotation = [
+                transform.rotation.pitch,
+                transform.rotation.yaw + 90,
+                transform.rotation.roll,
+            ]
         else:
             av_offset = [self.sumo_carla_offset[0], self.sumo_carla_offset[1], 0.0]
             av_sumo_location, av_sumo_rotation = carla_to_sumo(
-                transform.location,
-                transform.rotation,
-                self.av_shape,
-                av_offset
+                transform.location, transform.rotation, self.av_shape, av_offset
             )
 
         av_command = {
@@ -3517,7 +4838,7 @@ class CarlaCosim(object):
                 "position": [av_sumo_location[0], av_sumo_location[1]],
                 "speed": speed,
                 "sumo_angle": av_sumo_rotation[1],
-            }
+            },
         }
 
         return av_command
@@ -3599,26 +4920,112 @@ class CarlaCosim(object):
                     flush=True,
                 )
                 self._actor_filter_missing_center_warned = True
+            self._actor_filter_active_vehicle_ids = set(vehicles)
             return vehicles, vrus
 
         center_x, center_y = center_xy
-        radius_squared = self.actor_filter_radius * self.actor_filter_radius
+        previous_active_ids = self._actor_filter_active_vehicle_ids
+        enter_radius_squared = self.actor_filter_radius * self.actor_filter_radius
+        exit_radius = self.actor_filter_radius + self.actor_filter_hysteresis
+        exit_radius_squared = exit_radius * exit_radius
 
         filtered_vehicles = {}
+        active_vehicle_ids = set()
         for veh_id, veh_info in vehicles.items():
             if veh_id in {self.actor_filter_center_id, AV_SUMO_ID}:
                 filtered_vehicles[veh_id] = veh_info
+                active_vehicle_ids.add(veh_id)
                 continue
             vehicle_xy = self._actor_xy(veh_info)
             if vehicle_xy is None:
                 filtered_vehicles[veh_id] = veh_info
+                active_vehicle_ids.add(veh_id)
                 continue
             dx = vehicle_xy[0] - center_x
             dy = vehicle_xy[1] - center_y
+            radius_squared = (
+                exit_radius_squared if veh_id in previous_active_ids else enter_radius_squared
+            )
             if dx * dx + dy * dy <= radius_squared:
                 filtered_vehicles[veh_id] = veh_info
+                active_vehicle_ids.add(veh_id)
 
+        self._actor_filter_active_vehicle_ids = active_vehicle_ids
         return filtered_vehicles, vrus
+
+    def _update_physics_active_vehicle_ids(self, vehicles):  # noqa: C901
+        if not self.physics_radius_enabled:
+            return
+        center_info = vehicles.get(self.physics_radius_center_id)
+        center_xy = self._actor_xy(center_info) if center_info is not None else None
+        if center_xy is None:
+            self._physics_actor_distances = {}
+            self._physics_active_vehicle_ids = {AV_SUMO_ID}
+            return
+
+        previous_active_ids = set(self._physics_active_vehicle_ids)
+        enter_radius_squared = self.physics_radius * self.physics_radius
+        exit_radius = self.physics_radius + self.physics_radius_hysteresis
+        exit_radius_squared = exit_radius * exit_radius
+        active_vehicle_ids = {AV_SUMO_ID, self.physics_radius_center_id}
+        center_x, center_y = center_xy
+        distances = {self.physics_radius_center_id: 0.0}
+        quarantined = getattr(self, "_physics_quarantined_vehicle_ids", None)
+        if quarantined is None:
+            quarantined = {}
+            self._physics_quarantined_vehicle_ids = quarantined
+
+        for actor_id in tuple(quarantined):
+            if actor_id not in vehicles:
+                quarantined.pop(actor_id, None)
+                self._record_actor_mode_transition(
+                    actor_id,
+                    "quarantine_released",
+                    reason="actor_absent_beyond_filter",
+                )
+
+        for vehicle_id, vehicle_info in vehicles.items():
+            if vehicle_id in active_vehicle_ids:
+                continue
+            vehicle_xy = self._actor_xy(vehicle_info)
+            if vehicle_xy is None:
+                continue
+            dx = vehicle_xy[0] - center_x
+            dy = vehicle_xy[1] - center_y
+            distance_squared = dx * dx + dy * dy
+            distance = math.sqrt(distance_squared)
+            distances[vehicle_id] = distance
+            if vehicle_id in quarantined:
+                if distance <= exit_radius:
+                    continue
+                quarantined.pop(vehicle_id, None)
+                self._record_actor_mode_transition(
+                    vehicle_id,
+                    "quarantine_released",
+                    reason="exited_physics_hysteresis",
+                    distance_from_physics_center_m=distance,
+                )
+            radius_squared = (
+                exit_radius_squared if vehicle_id in previous_active_ids else enter_radius_squared
+            )
+            if distance_squared <= radius_squared:
+                active_vehicle_ids.add(vehicle_id)
+
+        self._physics_actor_distances = distances
+        self._physics_active_vehicle_ids = active_vehicle_ids
+        for actor_id in active_vehicle_ids - previous_active_ids:
+            self._record_actor_mode_transition(
+                actor_id,
+                "physics_selected",
+                reason="entered_physics_radius",
+            )
+        for actor_id in previous_active_ids - active_vehicle_ids:
+            if actor_id not in quarantined:
+                self._record_actor_mode_transition(
+                    actor_id,
+                    "transform_selected",
+                    reason="exited_physics_hysteresis",
+                )
 
     def sync_cosim_actor_to_carla(self, terasim_states):
         """Update all actors in cosim to CARLA from the given state dict."""
@@ -3657,7 +5064,9 @@ class CarlaCosim(object):
         pedestrian_actor_index = self._pedestrian_actor_index
         vehicles = terasim_states["agent_details"]["vehicle"]
         vrus = terasim_states["agent_details"]["vru"]
+        vehicles = self._filter_collision_removal_tombstones(vehicles)
         vehicles, vrus = self._filter_actor_details_by_radius(vehicles, vrus)
+        self._update_physics_active_vehicle_ids(vehicles)
         transform_batch = []
         ackermann_batch = []
         spawn_requests = []
@@ -3708,6 +5117,7 @@ class CarlaCosim(object):
         self._flush_actor_spawn_batch(spawn_requests, transform_batch)
         self._flush_actor_transform_batch(transform_batch)
         self._flush_actor_ackermann_batch(ackermann_batch)
+        self._handle_pending_background_demotions()
         self._prune_collision_sensors(vehicles.keys())
         self._raise_pending_authoritative_action_error()
         self._cleanup_stale_actors(cosim_id_record)
@@ -3744,7 +5154,7 @@ class CarlaCosim(object):
             utm_y = xodr_y + self._xodr_origin_utm[1]
             # Reverse transform: UTM -> SUMO CRS
             # _coord_transformer goes SUMO CRS -> UTM, we need the inverse
-            raw_x, raw_y = self._coord_transformer.transform(utm_x, utm_y, direction='INVERSE')
+            raw_x, raw_y = self._coord_transformer.transform(utm_x, utm_y, direction="INVERSE")
             # Add netOffset
             sumo_x = raw_x + self._sumo_net_offset[0]
             sumo_y = raw_y + self._sumo_net_offset[1]
@@ -3885,14 +5295,20 @@ class CarlaCosim(object):
                     response.error,
                 )
                 self._record_spawn_failure(
-                    actor_type, actor_id, request["sumo_location"], request["current_frame"]
+                    actor_type,
+                    actor_id,
+                    request["sumo_location"],
+                    request["current_frame"],
                 )
                 continue
 
             actor = self.world.get_actor(response.actor_id)
             if actor is None:
                 self._record_spawn_failure(
-                    actor_type, actor_id, request["sumo_location"], request["current_frame"]
+                    actor_type,
+                    actor_id,
+                    request["sumo_location"],
+                    request["current_frame"],
                 )
                 continue
 
@@ -3905,9 +5321,7 @@ class CarlaCosim(object):
             if request.get("enable_physics_after_spawn", False):
                 self._ackermann_actor_state.pop(actor_id, None)
                 actor_state = self._ackermann_actor_state.setdefault(actor_id, {})
-                self._initialize_ackermann_actor_geometry(
-                    actor, actor_id, actor_state
-                )
+                self._initialize_ackermann_actor_geometry(actor, actor_id, actor_state)
                 post_spawn_transform = self._sumo_front_to_carla_transform(
                     request["sumo_location"],
                     request["sumo_rotation"],
@@ -3924,7 +5338,10 @@ class CarlaCosim(object):
                 )
             else:
                 self._queue_actor_transform(
-                    actor, request["post_spawn_transform"], transform_batch, cosim_id=actor_id
+                    actor,
+                    request["post_spawn_transform"],
+                    transform_batch,
+                    cosim_id=actor_id,
                 )
                 if actor_type == "vru":
                     self._apply_vru_walker_control(
@@ -3958,9 +5375,7 @@ class CarlaCosim(object):
         on a per-tick world rescan.
         """
         if self.batch_transform_enabled and transform_batch is not None:
-            transform_batch.append(
-                (carla.command.ApplyTransform(actor.id, transform), cosim_id)
-            )
+            transform_batch.append((carla.command.ApplyTransform(actor.id, transform), cosim_id))
             return
         actor.set_transform(transform)
 
@@ -3968,9 +5383,7 @@ class CarlaCosim(object):
         """Apply queued actor transforms in one CARLA batch call."""
         if not transform_batch:
             return []
-        responses = self.client.apply_batch_sync(
-            [command for command, _ in transform_batch], False
-        )
+        responses = self.client.apply_batch_sync([command for command, _ in transform_batch], False)
         for (_, cosim_id), response in zip(transform_batch, responses):
             if response.error and cosim_id is not None:
                 # Stale handle (e.g. actor destroyed outside this loop): forget
@@ -3982,9 +5395,7 @@ class CarlaCosim(object):
         self, actor, control, ackermann_batch=None, direct_vehicle_control=False
     ):
         command_name = (
-            "ApplyVehicleControl"
-            if direct_vehicle_control
-            else "ApplyVehicleAckermannControl"
+            "ApplyVehicleControl" if direct_vehicle_control else "ApplyVehicleAckermannControl"
         )
         command_type = getattr(carla.command, command_name, None)
         if ackermann_batch is not None and command_type is not None:
@@ -4062,11 +5473,7 @@ class CarlaCosim(object):
             self._ackermann_feedback_state,
             self._ackermann_fail_closed_reasons,
         ):
-            for stale_id in [
-                actor_id
-                for actor_id in cache
-                if actor_id not in active_vehicle_ids
-            ]:
+            for stale_id in [actor_id for actor_id in cache if actor_id not in active_vehicle_ids]:
                 cache.pop(stale_id, None)
         if destroy_commands:
             self.client.apply_batch_sync(destroy_commands, False)
@@ -4101,7 +5508,7 @@ class CarlaCosim(object):
         exponent = min(failures - 1, 30)
         delay = min(
             self.spawn_failure_backoff_max_seconds,
-            self.spawn_failure_backoff_seconds * (2 ** exponent),
+            self.spawn_failure_backoff_seconds * (2**exponent),
         )
         abandoned = failures >= max(1, int(getattr(self, "spawn_max_attempts", 3)))
         self._spawn_failures[key] = {
@@ -4157,9 +5564,8 @@ class CarlaCosim(object):
         )
 
     def _resolve_sumo_location(self, actor_type, actor_id, actor_info, prefer_lane_relative=False):
-        use_reconstructed = (
-            prefer_lane_relative
-            and bool(actor_info.get("reconstructed_position_valid", False))
+        use_reconstructed = prefer_lane_relative and bool(
+            actor_info.get("reconstructed_position_valid", False)
         )
         if use_reconstructed:
             raw_location = {
@@ -4215,19 +5621,17 @@ class CarlaCosim(object):
             return (90.0 - math.degrees(orientation)) % 360.0
 
         if carla_actor is not None:
-            self._warn_missing_sumo_angle_once(actor_type, actor_id, "using previous CARLA yaw fallback")
+            self._warn_missing_sumo_angle_once(
+                actor_type, actor_id, "using previous CARLA yaw fallback"
+            )
             return (carla_actor.get_transform().rotation.yaw + 90.0) % 360.0
 
         self._warn_missing_sumo_angle_once(actor_type, actor_id, "skipping this tick")
         return None
 
     def _prune_spawn_failures(self, vehicle_ids, vru_ids):
-        active_keys = {
-            self._spawn_failure_key("vehicle", vehicle_id) for vehicle_id in vehicle_ids
-        }
-        active_keys.update(
-            self._spawn_failure_key("vru", vru_id) for vru_id in vru_ids
-        )
+        active_keys = {self._spawn_failure_key("vehicle", vehicle_id) for vehicle_id in vehicle_ids}
+        active_keys.update(self._spawn_failure_key("vru", vru_id) for vru_id in vru_ids)
         for key in list(self._spawn_failures):
             if key not in active_keys:
                 self._spawn_failures.pop(key, None)
@@ -4289,9 +5693,7 @@ class CarlaCosim(object):
                     sumo_location, sumo_rotation, shape, sumo_offset_correct
                 )
                 if uses_ackermann_physics
-                else sumo_to_carla(
-                    sumo_location, sumo_rotation, shape, sumo_offset_correct
-                )
+                else sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
             )
             if self._queue_actor_spawn(
                 spawn_requests,
@@ -4332,9 +5734,7 @@ class CarlaCosim(object):
                 if uses_ackermann_physics:
                     self._ackermann_actor_state.pop(veh_id, None)
                     actor_state = self._ackermann_actor_state.setdefault(veh_id, {})
-                    self._initialize_ackermann_actor_geometry(
-                        vehicle, veh_id, actor_state
-                    )
+                    self._initialize_ackermann_actor_geometry(vehicle, veh_id, actor_state)
                     carla_trasform = self._sumo_front_to_carla_transform(
                         sumo_location,
                         sumo_rotation,
@@ -4348,6 +5748,11 @@ class CarlaCosim(object):
                         veh_info.get("speed"),
                         carla_trasform,
                         spawn_transform,
+                    )
+                    self._record_actor_mode_transition(
+                        veh_id,
+                        "physics_initializing",
+                        reason="physics_actor_spawned",
                     )
                 else:
                     # Immediately set the correct road-level transform.
@@ -4364,6 +5769,8 @@ class CarlaCosim(object):
                 else sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
             )
             if uses_ackermann_physics:
+                actor_state = self._ackermann_actor_state.setdefault(veh_id, {})
+                self._acknowledge_physics_feedback_seed(veh_id, veh_info, actor_state)
                 physics_ready = self._ensure_ackermann_actor_physics(
                     vehicle,
                     veh_id,
@@ -4371,14 +5778,39 @@ class CarlaCosim(object):
                     carla_trasform,
                 )
                 if not physics_ready:
+                    seed_active = self._physics_feedback_seed_ready(actor_state)
+                    self._record_actor_mode_transition(
+                        veh_id,
+                        "physics_seeding" if seed_active else "physics_initializing",
+                        reason=(
+                            "waiting_for_seed_feedback_and_stable_physics"
+                            if seed_active
+                            else "waiting_for_stable_physics"
+                        ),
+                    )
                     return
-                # Non-master pipelines can reach actor processing before their
-                # first feedback is queued, so preserve their one-frame gate.
-                # Master applies state before its CARLA tick and then collects
-                # feedback, matching the feature pipeline without this delay.
+                seed_ready, seed_failure = self._physics_feedback_seed_control_gate(
+                    veh_id, veh_info, actor_state
+                )
+                if seed_failure:
+                    actor_state["physics_feedback_seed_failure_reason"] = seed_failure
+                    self._queue_authoritative_failure(veh_id, seed_failure)
+                    return
+                if not seed_ready:
+                    self._record_actor_mode_transition(
+                        veh_id,
+                        "physics_seeding",
+                        reason="waiting_for_maneuver_seed_resolution",
+                    )
+                    return
+                self._record_actor_mode_transition(
+                    veh_id,
+                    "physics",
+                    reason="physics_feedback_seed_complete",
+                    feedback_expected=True,
+                )
                 if self._waits_for_first_phase_a_feedback(veh_id):
                     return
-                actor_state = self._ackermann_actor_state.setdefault(veh_id, {})
                 carla_trasform = self._sumo_front_to_carla_transform(
                     sumo_location,
                     sumo_rotation,
@@ -4399,11 +5831,7 @@ class CarlaCosim(object):
                     control,
                     ackermann_batch,
                     direct_vehicle_control=(
-                        actor_state.get("control_mode")
-                        in {
-                            "emergency_brake",
-                            "fail_closed_brake",
-                        }
+                        actor_state.get("control_mode") in {"emergency_brake", "fail_closed_brake"}
                     ),
                 )
             else:
@@ -4485,7 +5913,9 @@ class CarlaCosim(object):
             z_off = 0.0 if "BIKE" in vru_info["type"] else shape[2] / 2.0
             sumo_offset = self._get_carla_offset(sumo_location, z_off)
             carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            self._queue_actor_transform(pedestrian, carla_trasform, transform_batch, cosim_id=vru_id)
+            self._queue_actor_transform(
+                pedestrian, carla_trasform, transform_batch, cosim_id=vru_id
+            )
 
         if carla_id > 0:
             self._apply_vru_walker_control(vru_info, sumo_angle, pedestrian)
@@ -4503,9 +5933,7 @@ class CarlaCosim(object):
         # same as a dead bridge today: restart CARLA before the next run; in
         # async mode the world just keeps free-running.
         preserve_world = (
-            getattr(self.args, "passive_tick", False)
-            or self.tick_master
-            or self.tick_async
+            getattr(self.args, "passive_tick", False) or self.tick_master or self.tick_async
         )
         if not preserve_world:
             # Configuring carla simulation in async mode.

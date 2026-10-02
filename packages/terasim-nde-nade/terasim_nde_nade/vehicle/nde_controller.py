@@ -1,10 +1,9 @@
+import numpy as np
+import terasim.utils as utils
 from addict import Dict
 from loguru import logger
-import numpy as np
-
 from terasim.agent.agent_controller import AgentController
 from terasim.overlay import traci
-import terasim.utils as utils
 
 from ..utils import (
     CommandType,
@@ -36,32 +35,42 @@ def get_all_route_edges():
 
 
 class NDEController(AgentController):
-    def __init__(self, simulator, params=None):
+    def __init__(
+        self,
+        simulator,
+        params=None,
+        *,
+        preserve_sumo_speed_control=False,
+        release_lane_change_mode=1621,
+    ):
         self.is_busy = False
         self.cached_control_command = None  # this is a dict, containing the control command for the vehicle with the timestep information
-        return super().__init__(
-            simulator, control_command_schema=NDECommand, params=params
-        )
+        self.preserve_sumo_speed_control = bool(preserve_sumo_speed_control)
+        self.release_lane_change_mode = int(release_lane_change_mode)
+        self.lane_change_request_count = 0
+        self.last_lane_change_request = None
+        self.last_command_end_reason = ""
+        self._last_request_generation = 0
+        return super().__init__(simulator, control_command_schema=NDECommand, params=params)
 
     def _update_controller_status(self, veh_id, current_time=None):
         """Refresh the state of the controller. This function will be called at each timestep as far as vehicle is still in the simulator, even if the vehicle is not controlled.
-        
+
         Args:
             veh_id (str): Vehicle ID.
-            current_time (float, optional): Current simulation time. Defaults to None.    
+            current_time (float, optional): Current simulation time. Defaults to None.
         """
         # if the controller is busy, detect if the current simulation time - the time of the cached control command is greater than the duration of the control command, then the controller is not busy anymore
         if self.is_busy:
-            current_time = (
-                traci.simulation.getTime() if current_time is None else current_time
-            )
+            current_time = traci.simulation.getTime() if current_time is None else current_time
             if (
                 current_time - self.cached_control_command.timestep
                 > self.cached_control_command.cached_command.duration
             ):
                 self.is_busy = False
                 self.cached_control_command = None
-                self.all_checks_on(veh_id)
+                self.last_command_end_reason = "duration_elapsed"
+                self._restore_control_modes(veh_id)
 
     def execute_control_command(self, veh_id, control_command, obs_dict):
         """Vehicle acts based on the input action.
@@ -71,6 +80,9 @@ class NDEController(AgentController):
             control_command (NDECommand): Control command.
             obs_dict (dict): Observation of the ego agent.
         """
+        generation = int((control_command.info or {}).get("request_generation", 0))
+        if generation and generation <= self._last_request_generation and not self.is_busy:
+            return
         if not self.is_busy:
             if control_command.command_type == CommandType.DEFAULT:
                 # all_checks_on(veh_id)
@@ -87,7 +99,7 @@ class NDEController(AgentController):
                 )
                 return
             else:
-                self.all_checks_off(veh_id)
+                self._prepare_control_modes(veh_id)
                 # other commands will have duration, which will keep the controller busy
                 self.is_busy = True
                 # if the control command is a trajectory, then interpolate the trajectory
@@ -119,11 +131,8 @@ class NDEController(AgentController):
         """
         if cached_control_command["cached_command"].command_type == CommandType.CUSTOM:
             if (
-                cached_control_command["cached_command"].custom_control_command
-                is not None
-                and cached_control_command[
-                    "cached_command"
-                ].custom_execute_control_command
+                cached_control_command["cached_command"].custom_control_command is not None
+                and cached_control_command["cached_command"].custom_execute_control_command
                 is not None
             ):
                 cached_control_command["cached_command"].custom_execute_control_command(
@@ -138,18 +147,14 @@ class NDEController(AgentController):
                 )
                 return
 
-        if (
-            cached_control_command["cached_command"].command_type
-            == CommandType.TRAJECTORY
-        ):
+        if cached_control_command["cached_command"].command_type == CommandType.TRAJECTORY:
             # pass
             self.execute_trajectory_command(
                 veh_id, cached_control_command["cached_command"], obs_dict
             )
         elif (
             cached_control_command["cached_command"].command_type == CommandType.LEFT
-            or cached_control_command["cached_command"].command_type
-            == CommandType.RIGHT
+            or cached_control_command["cached_command"].command_type == CommandType.RIGHT
         ):
             self.execute_lane_change_command(
                 veh_id,
@@ -157,10 +162,7 @@ class NDEController(AgentController):
                 obs_dict,
                 first_step=first_step,
             )
-        elif (
-            cached_control_command["cached_command"].command_type
-            == CommandType.ACCELERATION
-        ):
+        elif cached_control_command["cached_command"].command_type == CommandType.ACCELERATION:
             self.execute_acceleration_command(
                 veh_id, cached_control_command["cached_command"], obs_dict
             )
@@ -199,10 +201,7 @@ class NDEController(AgentController):
         )
         traci.vehicle.setPreviousSpeed(veh_id, closest_timestep_trajectory[3])
 
-    @staticmethod
-    def execute_lane_change_command(
-        veh_id, control_command, obs_dict, first_step=False
-    ):
+    def execute_lane_change_command(self, veh_id, control_command, obs_dict, first_step=False):
         """Execute the lane change command.
 
         Args:
@@ -218,6 +217,54 @@ class NDEController(AgentController):
         if first_step:  # only execute lane change command once
             indexOffset = 1 if control_command.command_type == CommandType.LEFT else -1
             traci.vehicle.changeLaneRelative(veh_id, indexOffset, control_command.duration)
+            self._last_request_generation = int(
+                (control_command.info or {}).get("request_generation", 0)
+            )
+            self.lane_change_request_count += 1
+            try:
+                lane_change_state = traci.vehicle.getLaneChangeState(veh_id, indexOffset)
+                model_state = int(lane_change_state[0])
+                post_state = int(lane_change_state[1])
+            except Exception:
+                model_state = None
+                post_state = None
+            try:
+                effective_lane_change_mode = int(traci.vehicle.getLaneChangeMode(veh_id))
+            except Exception:
+                effective_lane_change_mode = None
+            command_info = dict(control_command.info or {})
+            self.last_lane_change_request = {
+                "count": self.lane_change_request_count,
+                "simulation_time": float(traci.simulation.getTime()),
+                "direction": "left" if indexOffset > 0 else "right",
+                "index_offset": indexOffset,
+                "duration": float(control_command.duration),
+                "decision_source": command_info.get("decision_source", "nde"),
+                "source_lane_id": command_info.get("source_lane_id", ""),
+                "target_lane_id": command_info.get("target_lane_id", ""),
+                "model_lane_change_state": command_info.get("model_lane_change_state", model_state),
+                "post_lane_change_state": command_info.get("post_lane_change_state", post_state),
+                "effective_lane_change_mode": effective_lane_change_mode,
+                "reason_bits": tuple(command_info.get("reason_bits", ())),
+                "blocked": bool(command_info.get("blocked", False)),
+                "could_change_lane": command_info.get("could_change_lane"),
+                "lane_remaining": command_info.get("lane_remaining"),
+                "required_distance": command_info.get("required_distance"),
+                "request_generation": command_info.get("request_generation"),
+                "route_required": bool(command_info.get("route_required", False)),
+                "evaluation_reason": command_info.get("evaluation_reason", ""),
+            }
+            self.last_command_end_reason = ""
+            logger.info(
+                "NDE lane-change request: actor={} direction={} duration={} "
+                "source={} target={} count={}",
+                veh_id,
+                self.last_lane_change_request["direction"],
+                control_command.duration,
+                self.last_lane_change_request["source_lane_id"],
+                self.last_lane_change_request["target_lane_id"],
+                self.lane_change_request_count,
+            )
 
     @staticmethod
     def execute_acceleration_command(veh_id, control_command, obs_dict):
@@ -234,6 +281,24 @@ class NDEController(AgentController):
         final_speed = obs_dict["ego"]["velocity"] + acceleration * utils.get_step_size()
         final_speed = 0 if final_speed < 0 else final_speed
         traci.vehicle.setSpeed(veh_id, final_speed)
+
+    def _prepare_control_modes(self, veh_id):
+        """Disable autonomous lateral changes without stealing AV car-following."""
+        speed_mode = 31 if self.preserve_sumo_speed_control else 32
+        traci.vehicle.setSpeedMode(veh_id, speed_mode)
+        traci.vehicle.setLaneChangeMode(veh_id, 0)
+
+    def _restore_control_modes(self, veh_id):
+        traci.vehicle.setSpeedMode(veh_id, 31)
+        traci.vehicle.setLaneChangeMode(veh_id, self.release_lane_change_mode)
+
+    def reset_control_state(self, reason="reset"):
+        self.is_busy = False
+        self.cached_control_command = None
+        self.last_lane_change_request = None
+        self.lane_change_request_count = 0
+        self.last_command_end_reason = reason
+        self._last_request_generation = 0
 
     @staticmethod
     def all_checks_on(veh_id):
@@ -284,16 +349,18 @@ def interpolate_control_command(control_command, obs_dict):
                 future_trajectory_array,
             )
         )
-        # 1.2 clear the time of the trajectory, start from 0, with time resolution which is equal to the time resolution of the control command 
+        # 1.2 Start trajectory time at 0, using the command time resolution.
         trajectory_array[:, -1] = np.array(
-            [i*control_command.time_resolution for i in range(len(trajectory_array))]
+            [i * control_command.time_resolution for i in range(len(trajectory_array))]
         )
         # 1.3 interpolate the trajectory
         dt = traci.simulation.getDeltaT()
         interpolated_trajecotory = interpolate_future_trajectory(trajectory_array, dt)
         # 1.4 update the time of the trajectory
         interpolated_trajecotory[:, -1] += traci.simulation.getTime()
-        control_command.future_trajectory = interpolated_trajecotory[1:]  # TODO: Angle cannot be interpolated
+        control_command.future_trajectory = interpolated_trajecotory[
+            1:
+        ]  # TODO: Angle cannot be interpolated
         # 1.5 update the time resolution of the trajectory
         control_command.time_resolution = dt
         # 1.6. clip the trajectory based on the control command duration

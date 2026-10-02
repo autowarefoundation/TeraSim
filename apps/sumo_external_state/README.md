@@ -26,6 +26,15 @@ the lane-change model onto the realized CARLA lateral state, releases stale
 TraCI speed overrides, and lets the in-process service apply CARLA measured
 speed and acceleration with `setPreviousSpeed`.
 
+During a primary-lane switch after full-pose feedback, the patch projects the
+current world position onto the target lane's longitudinal and lateral coordinates. This
+runs after SUMO's longitudinal movement and before rebuilding rear occupancy,
+so differently placed custom lane-shape origins cannot cause a forward or
+backward position jump. Actual lane-centre separation also replaces the nominal
+lane-width shift, preserving lateral continuity and the remaining maneuver. The odometer excludes the coordinate adjustment.
+Focused TraCI/libsumo tests cover both directions with lane origins offset by
+four metres, checking world progress, distance travelled, and mode retention.
+
 The master cycle preserves the validated feature pipeline:
 
 1. Resolve the SUMO step requested by the previous cycle and apply its Phase B

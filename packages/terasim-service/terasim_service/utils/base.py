@@ -1,12 +1,11 @@
 import importlib
+from pathlib import Path
+
+import yaml
 from loguru import logger
 from omegaconf import OmegaConf
-from pathlib import Path
-import yaml
-
 from terasim.logger.infoextractor import InfoExtractor
 from terasim.simulator import Simulator
-
 from terasim_nde_nade.vehicle import NDEVehicleFactory
 from terasim_nde_nade.vru import NDEVulnerableRoadUserFactory
 
@@ -26,17 +25,17 @@ def load_config(config_file):
 
 def resolve_config_paths(config, config_file_path=None):
     """Resolve all relative paths in config to absolute paths based on path_resolution setting.
-    
+
     Args:
         config (dict): The configuration dictionary.
         config_file_path (str): Path to the configuration file (for resolving relative paths).
-    
+
     Returns:
         dict: The configuration with resolved absolute paths.
     """
     # Get path resolution mode from config
     path_resolution = config.get("path_resolution", "config_relative")
-    
+
     def resolve_path(path_str):
         """Resolve a single path based on path_resolution configuration"""
         path = Path(path_str)
@@ -54,15 +53,32 @@ def resolve_config_paths(config, config_file_path=None):
                 else:
                     # Fallback to current directory if no config file path
                     return str(Path(path).resolve())
-    
+
     # Resolve paths in the config
     if "input" in config:
         if "sumo_net_file" in config["input"]:
             config["input"]["sumo_net_file"] = resolve_path(config["input"]["sumo_net_file"])
         if "sumo_config_file" in config["input"]:
             config["input"]["sumo_config_file"] = resolve_path(config["input"]["sumo_config_file"])
-    
+
     return config
+
+
+def resolve_environment_av_control_mode(parameters):
+    """Resolve scenario AV authority while preserving the legacy alias."""
+    explicit_mode = parameters.get("av_control_mode")
+    if explicit_mode is not None:
+        explicit_mode = str(explicit_mode).strip().lower()
+        if explicit_mode not in {"external", "sumo"}:
+            raise ValueError(f"invalid environment.parameters.av_control_mode: {explicit_mode!r}")
+
+    legacy_present = "av_debug_control" in parameters
+    legacy_mode = None
+    if legacy_present:
+        legacy_mode = "sumo" if bool(parameters.get("av_debug_control")) else "external"
+    if explicit_mode is not None and legacy_mode is not None and explicit_mode != legacy_mode:
+        raise ValueError("environment.parameters.av_control_mode conflicts with av_debug_control")
+    return explicit_mode or legacy_mode or "external"
 
 
 def create_environment(config, base_dir):
@@ -79,10 +95,13 @@ def create_environment(config, base_dir):
     env_class = getattr(env_module, config["environment"]["class"])
 
     env_params = OmegaConf.create(config["environment"]["parameters"])
+    av_control_mode = resolve_environment_av_control_mode(env_params)
+    env_params.av_control_mode = av_control_mode
 
     return env_class(
-        av_cfg = env_params.AV_cfg,
+        av_cfg=env_params.AV_cfg,
         av_debug_control=env_params.get("av_debug_control", False),
+        av_control_mode=av_control_mode,
         vehicle_factory=NDEVehicleFactory(env_params),
         vru_factory=NDEVulnerableRoadUserFactory(env_params),
         info_extractor=InfoExtractor,
@@ -115,23 +134,24 @@ def create_simulator(config, base_dir):
         step_length=config["simulator"]["parameters"].get("step_length"),
         realtime_flag=config["simulator"]["parameters"].get("realtime_flag", False),
         output_path=base_dir,
-        sumo_output_file_types=config["simulator"]["parameters"][
-            "sumo_output_file_types"
-        ],
+        sumo_output_file_types=config["simulator"]["parameters"]["sumo_output_file_types"],
         seed=config["simulator"]["parameters"].get("sumo_seed", None),
         additional_sumo_args=["--start", "--quit-on-end"],
         traffic_scale=config["simulator"]["parameters"].get("traffic_scale", 1),
     )
 
+
 def set_random_seed(seed):
-    """Set the random seed for the simulation.
-    """
+    """Set the random seed for the simulation."""
     import random
+
     import numpy as np
+
     random.seed(seed)
     np.random.seed(seed)
     try:
         import torch
+
         torch.manual_seed(seed)
     except ImportError:
         pass
